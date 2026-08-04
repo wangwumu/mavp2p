@@ -20,6 +20,7 @@ import (
 	"github.com/bluenviron/gomavlib/v4/pkg/message"
 	"github.com/bluenviron/mavp2p/pkg/dumper"
 	"github.com/bluenviron/mavp2p/pkg/errorman"
+	"github.com/bluenviron/mavp2p/pkg/fifofilter"
 	"github.com/bluenviron/mavp2p/pkg/messageman"
 )
 
@@ -160,6 +161,10 @@ var cli struct {
 	Dump               bool          `help:"Dump telemetry to disk"`
 	DumpPath           string        `default:"dump/2006-01-02_15-04-05.tlog"`
 	DumpDuration       time.Duration `help:"Maximum duration of each dump segment" default:"1h"`
+	FifoEnable         bool          `help:"Enable FIFO-based filtered message output."`
+	FifoPath           string        `default:"/tmp/mavp2p-filter.fifo"`
+	FifoConfig         string        `default:"filter.yaml"`
+	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
 	Endpoints          []string      `arg:"" optional:""`
 }
 
@@ -171,6 +176,7 @@ type program struct {
 	errorMan   *errorman.Manager
 	messageMan *messageman.Manager
 	dumper     *dumper.Dumper
+	fifoFilter *fifofilter.Manager
 }
 
 func newProgram(args []string) (*program, error) {
@@ -201,6 +207,15 @@ func newProgram(args []string) (*program, error) {
 
 			case "dump-path":
 				return "Path of dump segments, in Golang's time.Format() format"
+
+			case "fifo-path":
+				return "Path of the FIFO named pipe for filtered message output."
+
+			case "fifo-config":
+				return "Path to JSON config file containing an array of Mavlink message IDs to filter."
+
+			case "fifo-fallback-path":
+				return "Path of the fallback file used when the FIFO is full or has no reader."
 
 			default:
 				return kong.DefaultHelpValueFormatter(value)
@@ -309,6 +324,24 @@ func newProgram(args []string) (*program, error) {
 		}
 	}
 
+	if cli.FifoEnable {
+		p.fifoFilter = &fifofilter.Manager{
+			Ctx:          ctx,
+			Wg:           &p.wg,
+			Dialect:      dialect,
+			FifoPath:     cli.FifoPath,
+			ConfigPath:   cli.FifoConfig,
+			FallbackPath: cli.FifoFallbackPath,
+		}
+		err = p.fifoFilter.Initialize()
+		if err != nil {
+			ctxCancel()
+			p.wg.Wait()
+			p.node.Close()
+			return nil, err
+		}
+	}
+
 	if cli.Quiet {
 		log.SetOutput(io.Discard)
 	}
@@ -365,6 +398,9 @@ func (p *program) run() {
 				p.messageMan.ProcessFrame(evt)
 				if p.dumper != nil {
 					p.dumper.ProcessFrame(evt)
+				}
+				if p.fifoFilter != nil {
+					p.fifoFilter.ProcessFrame(evt)
 				}
 
 			case *gomavlib.EventParseError:

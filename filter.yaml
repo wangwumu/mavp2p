@@ -1,0 +1,5 @@
+# Mavlink message IDs to write to FIFO
+- 0   # HEARTBEAT
+- 1   # SYS_STATUS
+- 30  # ATTITUDE
+- 33  # GLOBAL_POSITION_INT
