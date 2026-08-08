@@ -97,8 +97,9 @@ func TestFilterFIFO(t *testing.T) {
 
 	require.NotEmpty(t, received, "FIFO reader should have received data")
 
-	// Verify it's a valid Mavlink frame (starts with magic byte 0xFD for V2)
-	require.Equal(t, byte(0xFD), received[0], "should be a Mavlink V2 frame")
+	// Verify tlog format: 8-byte timestamp + V2 magic byte
+	require.GreaterOrEqual(t, len(received), 9, "tlog entry needs 8-byte timestamp + at least 1 frame byte")
+	require.Equal(t, byte(0xFD), received[8], "should be a Mavlink V2 frame after 8-byte timestamp")
 }
 
 func TestFilterFallback(t *testing.T) {

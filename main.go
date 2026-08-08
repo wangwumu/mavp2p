@@ -163,7 +163,7 @@ var cli struct {
 	DumpDuration       time.Duration `help:"Maximum duration of each dump segment" default:"1h"`
 	FifoEnable         bool          `help:"Enable FIFO-based filtered message output."`
 	FifoPath           string        `default:"/tmp/mavp2p-filter.fifo"`
-	FifoConfig         string        `default:"filter.yaml"`
+	FifoConfig         string        `default:"../filter.yaml"`
 	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
 	Endpoints          []string      `arg:"" optional:""`
 }

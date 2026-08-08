@@ -4,7 +4,7 @@ package fifofilter
 import (
 	"bytes"
 	"context"
-	"gopkg.in/yaml.v3"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +19,7 @@ import (
 	"github.com/bluenviron/gomavlib/v4/pkg/tlog"
 
 	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -152,25 +153,30 @@ func (m *Manager) run() {
 }
 
 func (m *Manager) handleEntry(entry *tlog.Entry) error {
-	// Marshal frame to internal buffer to get its wire size
+	// Marshal frame to internal buffer
 	m.encodeBuf.Reset()
 	if err := m.frameWriter.Write(entry.Frame); err != nil {
 		return fmt.Errorf("marshal frame: %w", err)
 	}
-	frameData := m.encodeBuf.Bytes()
-	frameSize := m.encodeBuf.Len()
+	frameBytes := m.encodeBuf.Bytes()
+
+	// Build tlog format: 8-byte timestamp (µs, big-endian) + frame bytes.
+	// Same format as the fallback .tlog file, so FIFO and fallback are interchangeable.
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], uint64(entry.Time.UnixMicro()))
+	tlogData := append(ts[:], frameBytes...)
 
 	// Try to write to FIFO
-	if err := m.writeToFifo(frameData, frameSize); err != nil {
-		// FIFO unavailable or full - fall back to tlog file.
-		// The frame's message has been encoded to MessageRaw by frameWriter.Write,
-		// but tlog.Writer handles that correctly (re-marshals without re-encoding).
+	if err := m.writeToFifo(tlogData); err != nil {
+		// FIFO unavailable or full — fall back to .tlog file.
+		// The frame has already been encoded to MessageRaw by frameWriter.Write above;
+		// tlog.Writer handles that correctly (re-marshals without re-encoding).
 		return m.fallbackTlog.Write(entry)
 	}
 	return nil
 }
 
-func (m *Manager) writeToFifo(data []byte, dataSize int) error {
+func (m *Manager) writeToFifo(data []byte) error {
 	// Reopen FIFO if not currently open (reader may have appeared)
 	if m.fifoFd == nil {
 		fd, err := openFifoWrite(m.FifoPath)
@@ -181,11 +187,11 @@ func (m *Manager) writeToFifo(data []byte, dataSize int) error {
 	}
 
 	// Check FIFO buffer space before writing
-	if !m.fifoHasSpace(dataSize) {
-		return fmt.Errorf("FIFO buffer full (need %d bytes)", dataSize)
+	if !m.fifoHasSpace(len(data)) {
+		return fmt.Errorf("FIFO buffer full (need %d bytes)", len(data))
 	}
 
-	// Write pre-marshaled frame bytes to FIFO
+	// Write tlog-format data (8-byte timestamp + frame) to FIFO
 	if _, err := m.fifoFd.Write(data); err != nil {
 		// Write failed - reader may have disconnected
 		m.fifoFd.Close()

@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-**mavp2p** is a Mavlink proxy/bridge/router CLI tool written in Go. It links UAV flight controllers (typically connected via serial) with ground stations over a network, routing Mavlink frames between endpoints: serial, UDP (server/client/broadcast), and TCP (server/client).
+**mavp2p** serves as the **mav_gateway** process in the 云端无人机管理系统 (cloud UAV management system). It is the real-time data plane — a Mavlink proxy/bridge/router CLI tool written in Go. It links UAV flight controllers (typically connected via serial) with ground stations over a network, routing Mavlink frames between endpoints: serial, UDP (server/client/broadcast), and TCP (server/client).
 
 Core library: [gomavlib](https://github.com/bluenviron/gomavlib) (same org).
+
+Part of a three-process architecture. See `~/CLAUDE.md` for the full system context. The other two processes (database write, gcs server) live in `~/uavm/`.
 
 ## Build and development commands
 
