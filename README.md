@@ -7,6 +7,24 @@
 [![Release](https://img.shields.io/github/v/release/bluenviron/mavp2p)](https://github.com/bluenviron/mavp2p/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-bluenviron/mavp2p-blue)](https://hub.docker.com/r/bluenviron/mavp2p)
 
+> **⚠️ 定制 fork（云无人机管理系统 mav_gateway）**
+>
+> 本仓库是 `bluenviron/mavp2p` 的定制 fork，用作「云无人机管理系统」的 **mav_gateway**
+>（实时数据面进程）。协议规范见 `~/abc_common/docs/60820.0/10_deviceID与payload加密公共规范.md` §3.2。
+>
+> 定制点：
+> - **有状态会话路由器**（`pkg/messageman`）：按帧头 deviceID 号段（GCS 段 / PX4 段）+ 来源
+>   socketID（channel）+ msgID/payload 长度路由 QGC↔PX4 会话，支撑多 QGC / 多 PX4 广域网
+>   （NAT/VPN）场景。**不解密**——加密任务帧按原样透传（空 dialect，全部 `MessageRaw`）。
+> - **80005 QGC 登记/保活心跳**：明文解析（payload = 关联 PX4 deviceID 集合），仅 mavp2p 消费、
+>   不转发给 PX4。
+> - **明文待命心跳**（msgID=0, PX4 段, payload<28）：登记 PX4 映射，扇出给在线 QGC。
+> - **边缘防重放**：读明文 counter 按 deviceID×方向（奇/偶）尽力判重。
+> - **FIFO → data_writer**：`--fifo-enable` 把下行帧经命名管道转 data_writer（消息白名单见
+>   `filter.yaml`）。
+>
+> 上游通用功能（多端点桥接、串口/TCP/UDP、域名、重连等）仍可用。
+
 _mavp2p_ is a flexible and efficient Mavlink proxy / bridge / router, implemented in the form of a command-line utility. It is used primarily to link UAV flight controllers, connected through a serial port, with ground stations on a network, but can be used to build any kind of routing involving serial, TCP and UDP, allowing communication across different physical layers or transport layers.
 
 This project makes use of the [**gomavlib**](https://github.com/bluenviron/gomavlib) library, a full-featured Mavlink library.
@@ -99,6 +117,21 @@ Dump telemetry to disk:
 ```
 ./mavp2p udps:0.0.0.0:5600 --dump --dump-path="dump/2006-01-02_15-04-05.tlog"
 ```
+
+Enable the FIFO → data_writer channel (protocol §3.2.5, typical mav_gateway deployment):
+
+```
+./mavp2p udps:0.0.0.0:5600 --fifo-enable \
+  --fifo-path /tmp/mavp2p-filter.fifo --fifo-config filter.yaml
+```
+
+Session-router parameters (protocol 附录 A.1, must match QGC/PX4 on all three sides):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--gcs-device-id-max` | `10000000` | GCS 段上界：deviceID < 该值判为 QGC/地面站，≥ 判为 PX4 |
+| `--max-qgc-linked-px4` | `16` | 单 QGC 最多关联的 PX4 数量上限 |
+| `--map-ttl` | `60s` | PX4 映射 / QGC 在线 / 配对缓存 TTL |
 
 ## Connecting popular software
 
