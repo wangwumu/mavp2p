@@ -1,0 +1,17 @@
+# data_writer FIFO 通道白名单（协议 10_deviceID与payload加密公共规范.md §3.2.5）。
+#
+# mavp2p 把 PX4 下行帧经 FIFO 转 data_writer（同机进程间，--fifo-path / --fifo-enable）。
+# 加密帧的帧头 msgID 沿用原始消息 msgID（§2.2：加密只改 payload），故白名单为
+# data_writer 解析（parser.go telemetryAccumulator/ExtractNotification）关心的消息 ID。
+#
+# 启动示例：
+#   mavp2p --fifo-enable --fifo-path /tmp/mavp2p-filter.fifo \
+#          --fifo-config filter.yaml udps:0.0.0.0:5600
+- 0       # HEARTBEAT：明文待命心跳（payload<28）与加密心跳（payload>=28），data_writer 按长度区分
+- 1       # SYS_STATUS（电量/系统状态）
+- 24      # GPS_RAW_INT（GPS 原始数据）
+- 30      # ATTITUDE（姿态）
+- 33      # GLOBAL_POSITION_INT（全局位置）
+- 74      # VFR_HUD（空速/地速/爬升率）
+- 147     # BATTERY_STATUS（电池详情）
+- 253     # STATUSTEXT（飞行状态文本，severity>=WARNING 生成通知）

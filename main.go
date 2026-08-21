@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"reflect"
 	"regexp"
 	"strconv"
 	"sync"
@@ -16,7 +15,6 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/bluenviron/gomavlib/v4"
 	"github.com/bluenviron/gomavlib/v4/pkg/dialect"
-	"github.com/bluenviron/gomavlib/v4/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v4/pkg/message"
 	"github.com/bluenviron/mavp2p/pkg/dumper"
 	"github.com/bluenviron/mavp2p/pkg/errorman"
@@ -31,25 +29,22 @@ var (
 	reSerial = regexp.MustCompile("^(.+?):([0-9]+)$")
 )
 
-// decode/encode only a minimal set of messages.
-// other messages change too frequently and cannot be integrated into a static tool.
-func generateDialect(hbDisable bool, streamreqDisable bool) *dialect.Dialect {
-	msgs := []message.Message{}
-
-	// add all messages with the TargetSystem and TargetComponent fields
-	var zero reflect.Value
-	for _, msg := range common.Dialect.Messages {
-		rv := reflect.ValueOf(msg).Elem()
-		if rv.FieldByName("TargetSystem") != zero && rv.FieldByName("TargetComponent") != zero {
-			msgs = append(msgs, msg)
-		}
-	}
-
-	if !hbDisable || !streamreqDisable {
-		msgs = append(msgs, &common.MessageHeartbeat{})
-	}
-
-	return &dialect.Dialect{Version: 3, Messages: msgs}
+// generateDialect 返回协议定制后的最小 dialect。
+//
+// 协议（10_deviceID与payload加密公共规范.md §2.2/§3.2）下 mavp2p 是「不解密的
+// 有状态会话路由器」：加密任务帧按原样透传、明文待命心跳（msgID=0）与 QGC
+// 登记心跳（msgID=80005）按帧头 deviceID 号段 + payload 长度判别。因此 **dialect
+// 必须保持空**：
+//
+//   - 任何在 dialect 内的消息一旦以加密帧出现（任务帧全部加密，含 HEARTBEAT、
+//     遥测等），gomavlib 会把它解码成结构化消息、转发时重新编码成明文而损坏；
+//   - 路由决策只依赖帧头 deviceID 号段、来源 socketID（channel）、msgID 与
+//     payload 长度，不依赖消息字段解码（见 pkg/messageman）。
+//
+// 消息一律以 message.MessageRaw 透传，frame.Reader 对未知消息不丢帧、不校验
+// CRC（frame/reader.go），frame.Writer 对 MessageRaw 原样写出（frame/writer.go）。
+func generateDialect() *dialect.Dialect {
+	return &dialect.Dialect{Version: 3, Messages: []message.Message{}}
 }
 
 type endpointType struct {
@@ -165,6 +160,9 @@ var cli struct {
 	FifoPath           string        `default:"/tmp/mavp2p-filter.fifo"`
 	FifoConfig         string        `default:"../filter.yaml"`
 	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
+	GCSDeviceIDMax     uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
+	MaxQGCLinkedPX4    int           `help:"单 QGC 最多关联 PX4 数量上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）" default:"16"`
+	MapTTL             time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
 	Endpoints          []string      `arg:"" optional:""`
 }
 
@@ -253,7 +251,7 @@ func newProgram(args []string) (*program, error) {
 		ctxCancel: ctxCancel,
 	}
 
-	dialect := generateDialect(cli.HbDisable, cli.StreamreqDisable)
+	dialect := generateDialect()
 
 	p.node = &gomavlib.Node{
 		Endpoints: endpointConfs,
@@ -294,10 +292,15 @@ func newProgram(args []string) (*program, error) {
 	}
 
 	p.messageMan = &messageman.Manager{
-		Ctx:              ctx,
-		Wg:               &p.wg,
-		StreamReqDisable: cli.StreamreqDisable,
-		Node:             p.node,
+		Ctx: ctx,
+		Wg:  &p.wg,
+		Config: messageman.Config{
+			StreamReqDisable: cli.StreamreqDisable,
+			GCSDeviceIDMax:   cli.GCSDeviceIDMax,
+			MaxQGCLinkedPX4:  cli.MaxQGCLinkedPX4,
+			MapTTL:           cli.MapTTL,
+		},
+		Node: p.node,
 	}
 	err = p.messageMan.Initialize()
 	if err != nil {

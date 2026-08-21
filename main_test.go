@@ -5,246 +5,55 @@ import (
 	"time"
 
 	"github.com/bluenviron/gomavlib/v4"
-	"github.com/bluenviron/gomavlib/v4/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v4/pkg/dialect"
+	"github.com/bluenviron/gomavlib/v4/pkg/message"
 	"github.com/stretchr/testify/require"
 )
 
-func TestBroadcast(t *testing.T) {
+// TestProgramEndToEnd 端到端冒烟：程序装配正常（newProgram → node + 会话路由器接线），
+// QGC 80005 登记心跳到达后被路由器消费、不转发给其他 client。
+// 协议路由细节由 pkg/messageman 单测覆盖；server 端 node.Events() 由 run() 独占消费，
+// 测试只从 client 端断言。
+func TestProgramEndToEnd(t *testing.T) {
 	p, err := newProgram([]string{"tcps:0.0.0.0:6666"})
 	require.NoError(t, err)
 	defer p.close()
 
-	pub := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
+	newPeer := func(sysid, compid byte) *gomavlib.Node {
+		c := &gomavlib.Node{
+			Endpoints: []gomavlib.Endpoint{
+				&gomavlib.EndpointTCPClient{Address: "127.0.0.1:6666"},
 			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      4,
-		OutComponentID:   5,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = pub.Initialize()
-	require.NoError(t, err)
-	defer pub.Close()
-
-	sub := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:      gomavlib.V2,
-		OutSystemID:     6,
-		OutComponentID:  7,
-		HeartbeatPeriod: 100 * time.Millisecond,
-		Dialect:         common.Dialect,
-	}
-	err = sub.Initialize()
-	require.NoError(t, err)
-	defer sub.Close()
-
-	<-pub.Events()
-	evt := <-pub.Events()
-	eventFr, ok := evt.(*gomavlib.EventFrame)
-	require.Equal(t, true, ok)
-	require.Equal(t, &common.MessageHeartbeat{
-		Type:           6,
-		SystemStatus:   4,
-		MavlinkVersion: 3,
-	}, eventFr.Frame.GetMessage())
-
-	msg := &common.MessageOdometry{
-		TimeUsec: 123456,
-		X:        1.2,
-		Y:        2.5,
-		Z:        3.4,
+			OutVersion:       gomavlib.V2,
+			OutSystemID:      sysid,
+			OutComponentID:   compid,
+			HeartbeatDisable: true,
+			Dialect:          &dialect.Dialect{Version: 3}, // MessageRaw 收发
+		}
+		require.NoError(t, c.Initialize())
+		return c
 	}
 
-	err = pub.WriteMessageAll(msg)
-	require.NoError(t, err)
+	qgc := newPeer(0x27, 0x10) // 帧头 sysid/compid → deviceID 10000（GCS 段）
+	defer qgc.Close()
+	other := newPeer(2, 3)
+	defer other.Close()
 
-	<-sub.Events()
-	evt = <-sub.Events()
-	eventFr, ok = evt.(*gomavlib.EventFrame)
-	require.Equal(t, true, ok)
-	require.Equal(t, msg, eventFr.Frame.GetMessage())
-}
+	// client 侧消费连接事件（server 侧连接由 newProgram.run() 处理）
+	<-qgc.Events()
+	<-other.Events()
 
-func TestTarget(t *testing.T) {
-	p, err := newProgram([]string{"tcps:0.0.0.0:6666"})
-	require.NoError(t, err)
-	defer p.close()
-
-	pub := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      4,
-		OutComponentID:   5,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = pub.Initialize()
-	require.NoError(t, err)
-	defer pub.Close()
-
-	sub1 := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      6,
-		OutComponentID:   7,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = sub1.Initialize()
-	require.NoError(t, err)
-	defer sub1.Close()
-
-	sub2 := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      8,
-		OutComponentID:   9,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = sub2.Initialize()
-	require.NoError(t, err)
-	defer sub2.Close()
-
-	<-pub.Events()
-	<-sub1.Events()
-	<-sub2.Events()
-
-	err = sub1.WriteMessageAll(&common.MessageHeartbeat{
-		Type:           common.MAV_TYPE_GCS,
-		SystemStatus:   4,
-		MavlinkVersion: 3,
+	// QGC 发 80005 明文登记心跳（payload 关联 PX4 deviceID=10000001）
+	err = qgc.WriteMessageAll(&message.MessageRaw{
+		ID:      80005,
+		Payload: []byte{1, 0x00, 0x98, 0x96, 0x81},
 	})
 	require.NoError(t, err)
 
-	err = sub2.WriteMessageAll(&common.MessageHeartbeat{
-		Type:           common.MAV_TYPE_GCS,
-		SystemStatus:   4,
-		MavlinkVersion: 3,
-	})
-	require.NoError(t, err)
-
-	for range 2 {
-		evt := <-pub.Events()
-		eventFr, ok := evt.(*gomavlib.EventFrame)
-		require.Equal(t, true, ok)
-		require.Equal(t, &common.MessageHeartbeat{
-			Type:           6,
-			SystemStatus:   4,
-			MavlinkVersion: 3,
-		}, eventFr.Frame.GetMessage())
-	}
-
-	msg := &common.MessageCommandLong{
-		TargetSystem:    6,
-		TargetComponent: 7,
-		Command:         common.MAV_CMD_NAV_FOLLOW,
-	}
-
-	err = pub.WriteMessageAll(msg)
-	require.NoError(t, err)
-
-	<-sub1.Events()
-	evt := <-sub1.Events()
-	eventFr, ok := evt.(*gomavlib.EventFrame)
-	require.Equal(t, true, ok)
-	require.Equal(t, msg, eventFr.Frame.GetMessage())
-
-	<-sub2.Events()
+	// 80005 仅 mavp2p 消费（§2.2/§3.2），不得转发给其他 client
 	select {
-	case <-sub2.Events():
-		t.Errorf("should not happen")
-	case <-time.After(100 * time.Millisecond):
+	case evt := <-other.Events():
+		t.Fatalf("80005 must not be forwarded to other client, got %T", evt)
+	case <-time.After(300 * time.Millisecond):
 	}
-}
-
-func TestTargetNotFound(t *testing.T) {
-	p, err := newProgram([]string{"tcps:0.0.0.0:6666"})
-	require.NoError(t, err)
-	defer p.close()
-
-	pub := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      4,
-		OutComponentID:   5,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = pub.Initialize()
-	require.NoError(t, err)
-	defer pub.Close()
-
-	sub := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPClient{
-				Address: "127.0.0.1:6666",
-			},
-		},
-		OutVersion:       gomavlib.V2,
-		OutSystemID:      8,
-		OutComponentID:   9,
-		Dialect:          common.Dialect,
-		HeartbeatDisable: true,
-	}
-	err = sub.Initialize()
-	require.NoError(t, err)
-	defer sub.Close()
-
-	<-pub.Events()
-	<-sub.Events()
-
-	err = sub.WriteMessageAll(&common.MessageHeartbeat{
-		Type:           common.MAV_TYPE_GCS,
-		SystemStatus:   4,
-		MavlinkVersion: 3,
-	})
-	require.NoError(t, err)
-
-	evt := <-pub.Events()
-	eventFr, ok := evt.(*gomavlib.EventFrame)
-	require.Equal(t, true, ok)
-	require.Equal(t, &common.MessageHeartbeat{
-		Type:           6,
-		SystemStatus:   4,
-		MavlinkVersion: 3,
-	}, eventFr.Frame.GetMessage())
-
-	msg := &common.MessageCommandLong{
-		TargetSystem:    6,
-		TargetComponent: 7,
-		Command:         common.MAV_CMD_NAV_FOLLOW,
-	}
-
-	err = pub.WriteMessageAll(msg)
-	require.NoError(t, err)
-
-	evt = <-sub.Events()
-	eventFr, ok = evt.(*gomavlib.EventFrame)
-	require.Equal(t, true, ok)
-	require.Equal(t, msg, eventFr.Frame.GetMessage())
 }
