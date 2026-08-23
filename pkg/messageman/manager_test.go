@@ -153,6 +153,14 @@ func encryptedPayload(counter uint64) []byte {
 	return p
 }
 
+// frameCounter 读取帧 payload 明文前 8 字节 counter（加密帧）。
+func frameCounter(ef *gomavlib.EventFrame) uint64 {
+	if raw, ok := ef.Frame.GetMessage().(*message.MessageRaw); ok && len(raw.Payload) >= 8 {
+		return binary.BigEndian.Uint64(raw.Payload[:8])
+	}
+	return 0
+}
+
 // registrationPayload 构造 80005 payload：deviceID_num(1B) + deviceID 集合（4B 大端）。
 func registrationPayload(devices ...uint32) []byte {
 	p := make([]byte, 1+len(devices)*4)
@@ -270,4 +278,102 @@ func TestRestartRecovery(t *testing.T) {
 	// 3. QGC 加密上行 → 定向转发给 PX4（配对已被动重建）
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
 	expectFrame(t, px4, 1*time.Second)
+}
+
+// TestPX4SocketIDDrift 覆盖 §3.2.1 核心规则 / §3.2.2 步骤 8 / §3.2.3 socketID 漂移：
+// PX4 失联恢复（5G 动态地址 NAT 重建）后，来源 socketID 与 PX4 映射表记录不一致，
+// mavp2p 须按帧头 deviceID（= 发送方自身）刷新映射表 + 配对表 PX4 侧 socketID，
+// 仍把加密下行帧定向转发给配对的任务 QGC（不得丢弃）；上行亦须路由到刷新后的 PX4。
+func TestPX4SocketIDDrift(t *testing.T) {
+	node, m, stop := newServer(t, "3349")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3349")
+	px4 := connectPeer(t, node, "3349")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：QGC 登记 + PX4 待命心跳（channel A）
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	// 待命心跳扇出给在线 QGC（§3.2.2 步骤 1），消费并断言
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
+
+	// QGC 加密上行建链（counter=1 奇数）→ 定向转发给 PX4
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+
+	// 正常下行（channel A，counter=2 偶数）→ 配对 QGC 收到
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(ef))
+
+	// PX4 重连：新连接（channel B）模拟 NAT 重建后 socketID 漂移。
+	px4b := connectPeer(t, node, "3349")
+	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
+	// §3.2.1 核心规则：按帧头 deviceID 刷新 socketID 后，仍应转发给配对 QGC。
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(4), frameCounter(ef))
+
+	// 漂移后继续下行（counter=6）→ 配对表 PX4 侧已刷新，持续定向可达
+	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(6), frameCounter(ef))
+
+	// 漂移后上行：px4Map.channel 已刷新到 channel B → QGC 加密上行路由到 px4b
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
+	ef = expectFrame(t, px4b, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(3), frameCounter(ef))
+
+	// 防重放 × 漂移：nonceKey 按 deviceID×方向、不随 channel 变；漂移后重放 counter=4 应丢弃
+	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+
+	// 防退化：用第三个 channel 重放曾只在旧 channel A 出现过的低 counter=2——
+	// device-keyed 下 2<=6 丢弃；若实现退化为 channel-keyed（px4c 水位为空）则会转发，
+	// 该断言即失败。此测试隔离验证 nonce 水位跨 channel 继承。
+	px4c := connectPeer(t, node, "3349")
+	feed(m, px4c.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+}
+
+// TestUnregisteredQGCUplinkIgnored 覆盖 §3.2.3 / §3.2.4：未登记 QGC（80005 被 MAP_TTL
+// 剪除、或未先登记就发包）的加密上行帧——帧头 deviceID = 目标 PX4 的 D、来源不在
+// QGC 在线表、counter 为奇数（上行特征）。mavp2p 不得把它误判为 PX4 下行而改写
+// PX4 映射表（那会导致上行命令被重定向、跨 QGC 泄露），须忽略，等该 QGC 补发 80005。
+func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
+	node, m, stop := newServer(t, "3350")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3350")
+	px4 := connectPeer(t, node, "3350")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：QGC 登记 + PX4 待命心跳 + 建链
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
+
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	expectFrame(t, px4, 1*time.Second)
+
+	// 未登记来源（未发 80005）发加密上行（奇数 counter）→ 忽略：不转发、不改写 PX4 映射
+	rogue := connectPeer(t, node, "3350")
+	feed(m, rogue.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(101)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+
+	// PX4 映射未被污染：真实 QGC 继续上行 → 仍路由到真实 PX4（channel A）
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(3), frameCounter(ef))
 }

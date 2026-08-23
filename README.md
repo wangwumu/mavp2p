@@ -10,7 +10,7 @@
 > **⚠️ 定制 fork（云无人机管理系统 mav_gateway）**
 >
 > 本仓库是 `bluenviron/mavp2p` 的定制 fork，用作「云无人机管理系统」的 **mav_gateway**
->（实时数据面进程）。协议规范见 `~/abc_common/docs/60820.0/10_deviceID与payload加密公共规范.md` §3.2。
+>（实时数据面进程）。协议规范见 `~/abc_common/docs/60822.0/10_deviceID与payload加密公共规范.md` §3.2。
 >
 > 定制点：
 > - **有状态会话路由器**（`pkg/messageman`）：按帧头 deviceID 号段（GCS 段 / PX4 段）+ 来源
