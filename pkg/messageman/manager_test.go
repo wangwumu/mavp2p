@@ -377,3 +377,147 @@ func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
 	require.Equal(t, uint64(3), frameCounter(ef))
 }
+
+// TestStandbyClearRequiresEncryptedSession 覆盖 §3.2.2 步骤 10 的前提条件。
+//
+// 明文待命心跳在「开机后」与「任务结束后」两个阶段都会周期出现，链路形态完全相同
+// （msgID=0 + 9B payload + PX4 段 deviceID），帧内无任何可区分之处；而清除 QGC↔PX4
+// 配对缓存只应在后者发生。唯一可用的判据是该 deviceID 的**下行 lastNonce 存在**
+// （⇒ 该 PX4 已切入过加密阶段；水位缺失的唯一窗口是握手瞬间，见 manager.go 该函数注释）。
+// 若无条件清除，开机待命期间每个心跳周期清一次（PX4 待命心跳默认 20Hz），QGC 登记/保活
+// 心跳（80005）刚重建的配对无法存活到 PX4 切入加密下行。
+//
+// 三格：① 开机待命期间待命心跳不得清除配对；② 任务结束回退（下行水位存在）必须清除；
+// ③ 清除会一并清空**下行**水位，故只发生一次——后续待命心跳不再触发。格 3 因此同时是
+// `delete(m.lastNonce, nkDown)` 的守护者：该行若被移除，格 3 的待命心跳会重新满足前提、
+// 清掉自己刚建的配对，末端下行断言随即超时（已用变异体实测）。
+func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
+	node, m, stop := newServer(t, "3351")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3351")
+	px4 := connectPeer(t, node, "3351")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// ---- 格 1「开机待命」：PX4 上电持续发明文待命心跳，其间 QGC 登记 → 配对必须存活 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	// PX4 上电在先、QGC 后启动：此刻 qgcOnline 为空，扇出无人（qgcOnline 由 80005 填充）
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	// 登记后的下一个心跳周期——该 deviceID 尚无下行水位，不得清除刚建立的配对
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出给在线 QGC（消费，避免积压）
+	// 配对存活的判据只能是「加密下行送达」：上行路由走 px4Map、不经配对（§3.2.2 步骤 3）
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(ef))
+
+	// ---- 格 2「任务结束回退」：下行水位存在 → 待命心跳必须清除配对 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second)
+	// 验证帧 counter=0：manager.go 对 counter=0 不判重放也不写水位，
+	// 故它不会污染格 3 的前置条件（回待命后 PX4 不再发加密下行，水位应保持为空）
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(0)))
+	expectNoFrame(t, qgc, 300*time.Millisecond) // 配对已清 → 不再转发
+
+	// ---- 格 3「清除只发生一次」：水位随配对被一并清空 → 后续待命心跳不再触发清除 ----
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second)
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
+	ef = expectFrame(t, qgc, 1*time.Second) // 配对仍存活 → 仍送达
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(6), frameCounter(ef))
+}
+
+// TestStandbyClearResetsUplinkWatermark 守 processStandbyHeartbeat 中无条件的
+// `delete(m.lastNonce, nkUp)`：任务结束回待命时，**上行**水位必须与配对一并清除。
+//
+// 判定力来自「新任务取一个低于旧任务水位的起点」：QGC 每次建链取随机 62 位奇数起点
+// （§2.5），约 50% 概率低于上一任务的末值。水位若残留，该上行会被边缘判重**静默丢弃**
+// （日志有 dropped replayed frame，但链路层表现为「建链成功却控制不了飞机」）。
+// 本用例中旧水位 1001、新起点 3，二者不会随机碰撞。
+func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
+	node, m, stop := newServer(t, "3352")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3352")
+	px4 := connectPeer(t, node, "3352")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// ---- 任务 1 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	// 先发一次心跳建 px4Map（此刻无在线 QGC，扇出无人），再登记 QGC，再发心跳产生扇出
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+
+	// 上行水位 1001（远高于任务 2 的起点）
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1001)))
+	expectFrame(t, px4, 1*time.Second) // 转发给 PX4，消费
+	// 下行水位 1000：使回待命时 hadDown 成立（否则配对本就不会被清）
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1000)))
+	expectFrame(t, qgc, 1*time.Second) // 送达配对 QGC，消费
+
+	// ---- 任务结束回待命：清配对 + 清两个方向的水位 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+
+	// ---- 任务 2：QGC 重新登记（幂等重建，§3.2.4.1），取低于旧水位的新起点 ----
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+
+	// 上行必须被转发：水位若残留（1001 > 3）则在此超时
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(3), frameCounter(ef))
+}
+
+// TestStandbyClearScopedToThatPX4 守 processStandbyHeartbeat 中的
+// `k.px4DeviceID == did`：一架 PX4 回待命只清**它自己**的配对，不得波及别的 PX4。
+//
+// 单 PX4 的用例分不出「清该架」与「清全表」（结果相同），故必须两台：PX4_A 回待命后，
+// PX4_B 的加密下行仍须送达已配对的 QGC——B 的配对若被连带清掉，下行将无接收者。
+func TestStandbyClearScopedToThatPX4(t *testing.T) {
+	node, m, stop := newServer(t, "3353")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3353")
+	px4a := connectPeer(t, node, "3353")
+	px4b := connectPeer(t, node, "3353")
+
+	const px4DeviceIDB = uint32(10000002)
+	aInc, aCom, aSys, aComp := didBytes(px4DeviceID)
+	bInc, bCom, bSys, bComp := didBytes(px4DeviceIDB)
+
+	// 两架 PX4 上电待命；QGC 一次登记两个 deviceID（80005 payload 为集合）
+	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
+	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 0, standbyHeartbeatPayload()))
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID, px4DeviceIDB)))
+	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+
+	// 两条链路各自建链（上行建配对、下行建水位）
+	feed(m, qgc.ch, makeFrame(aInc, aCom, aSys, aComp, 33, encryptedPayload(21)))
+	expectFrame(t, px4a, 1*time.Second)
+	feed(m, qgc.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(11)))
+	expectFrame(t, px4b, 1*time.Second)
+	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 33, encryptedPayload(20)))
+	expectFrame(t, qgc, 1*time.Second)
+	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(10)))
+	expectFrame(t, qgc, 1*time.Second)
+
+	// ---- PX4_A 任务结束回待命：只应清掉 A 的配对 ----
+	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+
+	// B 的配对必须存活：其加密下行仍应送达 QGC（被连带清掉则在此超时）
+	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(12)))
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint64(12), frameCounter(ef))
+}

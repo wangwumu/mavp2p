@@ -223,7 +223,8 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 
 	case msgID == msgIDHeartbeat && did >= m.gcsDeviceIDMax() &&
 		plen >= 0 && plen < encryptedPayloadMinLen:
-		// PX4 明文待命心跳（§3.2.2 步骤 1/10）：登记映射 + 清配对 + 扇出在线 QGC。
+		// PX4 明文待命心跳（§3.2.2 步骤 1/10）：登记映射 + 扇出在线 QGC；
+		// 仅当该 deviceID 有下行水位（经历过加密会话，即任务结束）才清配对。
 		m.processStandbyHeartbeat(srcCh, did, fr)
 
 	default:
@@ -296,18 +297,37 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 		m.px4Map[did] = &px4Entry{channel: srcCh, lastSeen: now}
 		log.Printf("PX4 appeared: deviceID=%d channel=%s", did, srcCh)
 	}
-	// 回待命：清除该 PX4 的所有 QGC↔PX4 配对缓存（§3.2.2 步骤 10），回到可再次建链状态
-	for k := range m.pairs {
-		if k.px4DeviceID == did {
-			delete(m.pairs, k)
+	// 回待命：清除该 PX4 的所有 QGC↔PX4 配对缓存（§3.2.2 步骤 10），回到可再次建链状态。
+	// 前提条件：该 deviceID 的**下行** lastNonce 存在 ⇒ 本进程曾路由过它一帧加密下行，
+	// 即该 PX4 已切入过加密阶段；「开机待命」不满足。
+	// 「开机待命」与「任务结束回待命」的明文心跳形态完全相同（msgID=0 + 9B payload +
+	// PX4 段 deviceID；空 dialect 不解码 payload，路由器无从区分），唯此水位能判别。
+	// 若无条件清除，开机待命期间每个心跳周期（PX4 待命心跳默认 20Hz，§2.5）都会清掉
+	// QGC 刚经 80005 登记的配对，使其无法存活到 PX4 切入加密下行。
+	// 水位缺失 ≠ 未经历过会话：上行水位由「上行且 px4Map 命中」写入、下行水位由「下行且
+	// px4Map 命中」写入，二者独立。水位缺失的全部情形只有两处——从未建链，或握手期第一条
+	// 加密上行已被路由、PX4 第一条加密下行尚未到达；后者的配对正是刚经 80005 建立、必须
+	// 保留到切入加密下行的那一条，故此时不清同样正确。⇒ 本判据对「该不该清」是充要的。
+	// 前提：PX4 不允许崩溃重启（PX4 侧状态连续，不会凭空退回待命）；mavp2p/QGC 重启则
+	// 两侧水位一并清空，也不落入该窗口。
+	nkUp := nonceKey{deviceID: did, odd: true}
+	nkDown := nonceKey{deviceID: did, odd: false}
+	if _, hadDown := m.lastNonce[nkDown]; hadDown {
+		for k := range m.pairs {
+			if k.px4DeviceID == did {
+				delete(m.pairs, k)
+			}
 		}
 	}
-	// 同步清边缘防重放水位（§2.5：任务结束 PX4 软重置全局 lastNonce 为 unset；新任务
-	// QGC 取随机 62 位奇数起点）。若 mavp2p 不清，新 QGC 随机起点若低于旧任务水位会被
-	// 边缘判重误杀（≈50% 概率阻塞新任务上行，直到 counter 追平）。清后仅重开防重放
-	// 窗口（协议 §2.5「重启边界」已接受的残余风险，权威防重放在解密层）。
-	delete(m.lastNonce, nonceKey{deviceID: did, odd: true})
-	delete(m.lastNonce, nonceKey{deviceID: did, odd: false})
+	// 水位照清，与配对是两件事（§2.5：任务结束 PX4 软重置**两个方向**的 lastNonce 为
+	// unset，奇/偶各一条；新任务 QGC 取随机 62 位奇数起点）。若 mavp2p 不清，新 QGC 随机
+	// 起点若低于旧任务水位会被边缘判重误杀（≈50% 概率阻塞新任务上行，直到 counter 追平）。
+	// 清后仅重开防重放窗口（协议 §2.5「重启边界」已接受的残余风险，权威防重放在解密层）。
+	// 注：本清除无前置条件，故在握手窗口（见上方「水位缺失」第二种情形）会连带清掉刚写入的
+	// 上行水位，使该会话第一条上行可被重放一次（实测：无该次心跳时重放被拦、有则放行）。
+	// 同样由解密方的权威防重放兜住；下一条上行即重新写入水位，窗口为一条上行帧的间隔。
+	delete(m.lastNonce, nkUp)
+	delete(m.lastNonce, nkDown)
 	// 锁内收集在线 QGC 快照
 	qgcs := make([]*gomavlib.Channel, 0, len(m.qgcOnline))
 	for ch := range m.qgcOnline {

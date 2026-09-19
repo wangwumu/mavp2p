@@ -5,19 +5,19 @@
 # msgID（§2.2：加密只改 payload），故白名单为 data_writer 解析
 # （parser.go telemetryAccumulator/ExtractNotification）关心的消息 ID。
 #
-# 版本 60822.0（加密心跳扩展，见 加密心跳扩展基础状态.md）：
+# 版本 60824.0（加密心跳扩展，见 加密心跳扩展基础状态.md）：
 # PX4 在 GCS/Normal 实例精简独立遥测流（GLOBAL_POSITION_INT / ATTITUDE /
 # GPS_RAW_INT / BATTERY_STATUS 等关闭），基础状态并入加密心跳明文追加的 EXT 段。
-# 因此 msgID 0（HEARTBEAT）是 data_writer 了解飞行器位置/速度/姿态/GPS/电池/模式
-# 的唯一遥测来源——加密心跳（payload>=28）解密后解析 EXT 写库，明文待命心跳
-# （payload<28）按长度区分、用于更新在线状态。下方 24/30/33 在精简清单内、
-# 1/147 与 EXT 电池字段重叠，精简后 GCS 链路通常不再出现；74 未列入精简清单，
-# 保留以便空速独立流恢复时照常收录。
+# 因此 msgID 0（HEARTBEAT）是 data_writer 了解飞行器位置/速度/姿态/GPS/电池/模式/
+# 相对高度/空速/VTOL 阶段/起降/电流/温度/异常/时间戳的唯一遥测来源——加密心跳
+# （payload>=28）解密后解析 EXT 写库，明文待命心跳（payload<28）按长度区分、
+# 用于更新在线状态。下方 24/30/33 在精简清单内、1/147 与 EXT 电池字段重叠，
+# 精简后 GCS 链路通常不再出现；74 未列入精简清单，保留以便空速独立流恢复时照常收录。
 #
 # 启动示例：
 #   mavp2p --fifo-enable --fifo-path /tmp/mavp2p-filter.fifo \
 #          --fifo-config filter.yaml udps:0.0.0.0:5600
-- 0       # HEARTBEAT：明文待命心跳（payload<28）与加密心跳（payload>=28，74B 者含 EXT 37B），data_writer 按长度区分；60822.0 下为唯一基础状态来源
+- 0       # HEARTBEAT：明文待命心跳（payload<28）与加密心跳（payload>=28，92B 者含 EXT 55B；60822.0 的 74B/37B 为其前身），data_writer 按长度区分；60824.0 下为唯一基础状态来源
 - 1       # SYS_STATUS（电量/系统状态；电压/剩余已并入 EXT，精简后可能不出现）
 - 24      # GPS_RAW_INT（GPS 原始数据；精简清单明确关闭，GCS 链路通常不出现）
 - 30      # ATTITUDE（姿态；EXT 已含欧拉角，精简清单明确关闭，GCS 链路通常不出现）
