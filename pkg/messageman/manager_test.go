@@ -153,6 +153,17 @@ func encryptedPayload(counter uint64) []byte {
 	return p
 }
 
+// encryptedNonHeartbeatPayload 构造**非心跳**（msgID != 0）的加密帧 payload：
+// counter(8B 明文) + 密文 28B = 36B ≥ encryptedPayloadMinLen。
+//
+// 与 encryptedPayload（仅 12B，短于阈值）的分工：后者只能验证「短帧不受拦截判据
+// 影响」，本夹具才把长度也做到达标，从而单独钉住拦截判据的 **msgID 维度**。
+func encryptedNonHeartbeatPayload(counter uint64) []byte {
+	p := make([]byte, 8+28)
+	binary.BigEndian.PutUint64(p[:8], counter)
+	return p
+}
+
 // frameCounter 读取帧 payload 明文前 8 字节 counter（加密帧）。
 func frameCounter(ef *gomavlib.EventFrame) uint64 {
 	if raw, ok := ef.Frame.GetMessage().(*message.MessageRaw); ok && len(raw.Payload) >= 8 {
@@ -624,4 +635,79 @@ func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
 	ef := expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint64(3), frameCounter(ef))
+}
+
+// TestNonHeartbeatEncryptedUplinkNotBlocked 守拦截判据的 **msgID 维度**：置位后只拦
+// `msgID=0` 的加密上行心跳，长度同样达标的**非心跳**加密上行必须照常送达 PX4
+// （§2.5 只拦心跳；任务/围栏/集结点等其余上行不受影响）。
+//
+// 判定力来自「把非心跳帧的长度也做到 ≥28B」（encryptedNonHeartbeatPayload）：若判据
+// 退化成只看长度（去掉 `msgID == msgIDHeartbeat`），末帧会被误拦、断言超时。
+//
+// 前置中的阴性对照不可省：它以「加密心跳确实被拦」证明置位真的生效——否则末帧放行
+// 也可能只是标记从未置位，用例即使绿也说明不了任何事。
+func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
+	node, m, stop := newServer(t, "3356")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3356")
+	px4 := connectPeer(t, node, "3356")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：QGC 登记 + PX4 待命心跳 + PX4 加密心跳 ⇒ 置位「已建链」。
+	// 不消费 QGC 侧的下行扇出：本用例只在 PX4 队列上断言，配对与否不影响结论。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+
+	// 阴性对照：标记确已置位 ⇒ QGC 的加密心跳被拦
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(3)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// 正题：长度同样达标、但 msgID != 0 的加密上行必须放行
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedNonHeartbeatPayload(5)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(5), frameCounter(ef))
+}
+
+// TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark 守复位点的**无条件性**：
+// 「已建链标记」的复位不得附加「该 deviceID 存在下行水位」这一前提——后者只是**清配对**
+// 的前提（见 TestStandbyClearRequiresEncryptedSession），两者不是同一个条件。
+//
+// 依据：manager.go 写下行水位的那句是 `if nk != nil`，而 counter=0 的帧既不判重放也不
+// 写水位，置位判据（msgID=0 且 plen ≥ 28）却与 counter 无关 ⇒「已置位、但无下行水位」
+// 是**可达状态**，一条 counter=0 的加密心跳即可造出来。
+//
+// 若复位被改成与清配对同一个前提，标记在该状态下永久卡住 ⇒ 该 PX4 下一会话的首帧加密
+// 上行心跳被拦、链路再也建不起来（§2.5「该复位无前提条件」）。
+func TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark(t *testing.T) {
+	node, m, stop := newServer(t, "3357")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3357")
+	px4 := connectPeer(t, node, "3357")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：QGC 登记 + PX4 明文待命心跳
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+
+	// counter=0 的加密心跳：置位「已建链」，但**不写下行水位**（counter=0 无 nonce key）；
+	// 此时尚无配对，该下行帧也不扇出给任何 QGC。
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(0)))
+
+	// 阴性对照：标记确已置位 ⇒ QGC 的加密心跳被拦
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(3)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// 明文待命心跳：必须复位标记（此刻并无下行水位，清配对的前提并不成立）
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+
+	// 复位后：QGC 的加密心跳必须恢复放行
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(7), frameCounter(ef))
 }
