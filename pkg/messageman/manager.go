@@ -51,6 +51,12 @@ type Config struct {
 type px4Entry struct {
 	channel  *gomavlib.Channel
 	lastSeen time.Time
+	// handshaked 该 PX4 是否已切入加密阶段（收到过它的**加密** HEARTBEAT）。置位后
+	// mavp2p 拦截 QGC 发往该 PX4 的加密 GCS 心跳（§2.5）。由加密下行心跳置位、由
+	// 明文待命心跳复位——两态与心跳形态一一对应：明文待命心跳恒 9B、加密心跳恒
+	// ≥ encryptedPayloadMinLen，中间没有别的取值，也不与其它 msgID 撞车。mavp2p
+	// 不解密、拿不到角色信息，长度是它唯一可用且无歧义的信号。
+	handshaked bool
 }
 
 // qgcEntry QGC 在线表项：socketID（channel）→ 最近登记心跳时间。
@@ -293,6 +299,12 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 		}
 		e.channel = srcCh
 		e.lastSeen = now
+		// 回待命复位 handshaked（§2.5）：明文待命心跳 ⇒ 该 PX4 已退回未握手态
+		// （PX4 侧 `_tx_last_nonce_set` 为 false，此后只发明文心跳），下一次建链时
+		// QGC 的加密心跳必须能重新抵达它。只置位不复位的话，任务结束后新会话的第一条
+		// 上行若恰是 GCS 心跳（QGC 建链后即 1Hz 发），会被永久拦死、链路再也建不起来
+		// ——即用户 2026-09-27 指出的「上行心跳被拦则加密链路建立不起来」的原形。
+		e.handshaked = false
 	} else {
 		m.px4Map[did] = &px4Entry{channel: srcCh, lastSeen: now}
 		log.Printf("PX4 appeared: deviceID=%d channel=%s", did, srcCh)
@@ -351,11 +363,18 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	// 注意：lastNonce 的写入延后到「确认本帧会被路由」之后——被拦截/忽略的帧不推进
 	// 防重放水位，避免未登记 QGC 上行（被忽略）推进奇数水位、误杀后续合法上行。
 	// （下行帧即便无配对接收者，也会因刷新状态而推进水位。）
+	// plen 同时用于识别加密心跳（msgID=0 且 ≥ encryptedPayloadMinLen，§2.5）。
+	msg := fr.GetMessage()
+	msgID := msg.GetID()
 	var counter uint64
 	odd := false
-	if raw, ok := fr.GetMessage().(*message.MessageRaw); ok && len(raw.Payload) >= 8 {
-		counter = binary.BigEndian.Uint64(raw.Payload[0:8])
-		odd = counter&1 == 1 // 上行（QGC）奇数 / 下行（PX4/abc_vtol）偶数
+	plen := -1
+	if raw, ok := msg.(*message.MessageRaw); ok {
+		plen = len(raw.Payload)
+		if plen >= 8 {
+			counter = binary.BigEndian.Uint64(raw.Payload[0:8])
+			odd = counter&1 == 1 // 上行（QGC）奇数 / 下行（PX4/abc_vtol）偶数
+		}
 	}
 
 	m.mu.Lock()
@@ -405,6 +424,16 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 			e.px4Ch = px4.channel
 			e.lastSeen = time.Now()
 		}
+		// 加密心跳拦截（§2.5）：该 PX4 已握手（曾发出加密心跳 ⇒ 加密链路已建成）后，
+		// 不再把 QGC 的加密 GCS 心跳转给它。本位置受两条约束夹定，都不可挪：必须在
+		// 上方 QGC 在线表与配对的刷新**之后**（心跳 1Hz 是配对的主要保活源，拦在刷新前
+		// 会让配对因 MAP_TTL 静默过期），又必须在下方 lastNonce 写入**之前**（被拦帧
+		// 不推进防重放水位，§3.1；否则心跳的 counter 会把水位抬到普通上行之上，误杀
+		// 后续合法上行）。不记日志：1Hz 常态拦截会刷屏，且拦截本身是设计行为。
+		if msgID == msgIDHeartbeat && plen >= encryptedPayloadMinLen && px4.handshaked {
+			m.mu.Unlock()
+			return
+		}
 		if nk != nil {
 			m.lastNonce[*nk] = counter
 		}
@@ -438,10 +467,13 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	// socketID 漂移刷新（§3.2.1 核心规则 / §3.2.2 步骤 8 / §3.2.3）：PX4 经 5G 动态地址
 	// NAT 重建后 socketID 会变，每次收到 PX4 帧都比对来源 socketID，变化即以 deviceID
 	// 定位原表项并更新，否则后续定向转发全部落空。
-	// 安全边界：本刷新无密码学认证（与待命心跳登记一样）——任何未登记为 QGC 的来源
-	// 发送一帧**偶数 counter/0**、帧头 deviceID 命中已知 PX4 的帧即可触发 socketID
-	// 重定向（登记过期的合法 QGC 上行恒为奇数，已被上方 odd 判据拦截；剩余触发面即
-	// 部署边界内的注入）。该风险由 §2.1.1 部署网络边界（mavp2p 不落公网、内网/VPN/IP
+	// 安全边界：本分支承担**两项**无密码学认证的状态变更（与待命心跳登记一样）——
+	//   ① socketID 重定向（见下）：任何未登记为 QGC 的来源，发一帧**偶数 counter/0**、
+	//      帧头 deviceID 命中已知 PX4 的帧即可触发；
+	//   ② 置位「已建链标记」（见下方「握手完成置位」）：该帧若同时满足 `msgID=0 且
+	//      plen >= encryptedPayloadMinLen`，即把该 PX4 置为已建链，**使其 QGC 加密心跳被拦**。
+	// 两项的剩余触发面都只是部署边界内的注入——登记过期的合法 QGC 上行恒为奇数，已被
+	// 上方 odd 判据拦截。两项风险同由 §2.1.1 部署网络边界（mavp2p 不落公网、内网/VPN/IP
 	// 白名单）保障，协议层不为这些状态额外设计认证（§3.2.3「无认证路由状态的安全依赖」）。
 	if px4.channel != srcCh {
 		log.Printf("PX4 socketID drifted: deviceID=%d %s -> %s", did, px4.channel, srcCh)
@@ -449,6 +481,14 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	}
 	now := time.Now()
 	px4.lastSeen = now
+	// 握手完成置位（§2.5）：PX4 发来**加密** HEARTBEAT ⇒ 它的加密链路已建成，此后
+	// mavp2p 拦截 QGC 发往该 deviceID 的加密 GCS 心跳。判据只用 msgID 与长度、不解密；
+	// 置位点必须在本分支 px4Map 命中之后（未命中在更上方已早退），否则未知 deviceID
+	// 的加密帧也能置位。
+	if msgID == msgIDHeartbeat && plen >= encryptedPayloadMinLen && !px4.handshaked {
+		px4.handshaked = true
+		log.Printf("PX4 handshake complete: deviceID=%d (%s), GCS heartbeats blocked", did, srcCh)
+	}
 	// 刷新该 deviceID 所有配对的 PX4 侧 socketID 与活跃时间，保持三元组一致；
 	// 刷新 lastSeen 使配对保活不只依赖 QGC 80005/上行——QGC 保活中断但 PX4 持续下行时
 	// 配对不会因 MAP_TTL 静默过期（§3.2.3 保活约束）

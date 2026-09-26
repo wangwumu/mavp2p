@@ -176,6 +176,15 @@ func standbyHeartbeatPayload() []byte {
 	return make([]byte, 9)
 }
 
+// encryptedHeartbeatPayload 构造**加密** HEARTBEAT（msgID=0）的 payload：
+// counter(8B 明文) + 密文（4B deviceID + 9B 原始 HEARTBEAT payload）+ tag(16B) = 37B ≥ 28。
+// 内容对路由器无意义，判据只有 msgID 与长度（§2.3/§2.5）。
+func encryptedHeartbeatPayload(counter uint64) []byte {
+	p := make([]byte, 37)
+	binary.BigEndian.PutUint64(p[:8], counter)
+	return p
+}
+
 // TestSessionRouting 覆盖 §3.2 主流程：登记 → 待命心跳扇出 → 加密上行建链 →
 // 加密下行只发配对 QGC → 回待命清配对。
 func TestSessionRouting(t *testing.T) {
@@ -520,4 +529,99 @@ func TestStandbyClearScopedToThatPX4(t *testing.T) {
 	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(12)))
 	ef := expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint64(12), frameCounter(ef))
+}
+
+// TestGCSHeartbeatBlockedAfterHandshake 覆盖 §2.5 加密心跳拦截：
+// PX4 一旦发出**加密** HEARTBEAT（msgID=0 且 payload≥28），即视为握手完成，
+// mavp2p 此后拦截 QGC 发往该 PX4 的加密 GCS 心跳（同为 msgID=0），使其不再抵达 PX4；
+// PX4 回**明文**待命心跳（退回待命态）后恢复放行。
+//
+// 判据之所以成立，是因为两种心跳在路由器眼里是**双向封闭**的两种形态：明文待命心跳
+// 恒 9B、加密心跳恒 ≥28B，中间没有别的取值，也不与其它 msgID 撞车。mavp2p 不解密、
+// 拿不到角色信息，长度是它唯一可用且无歧义的信号（2026-09-27 用户裁定）。
+//
+// 五格：① 未握手时加密心跳必须放行——它是 PX4 建链的唯一触发源（PX4 靠第一条解密
+// 成功的奇数 counter 建链），拦了则链路永远建不起来；② PX4 加密心跳本身不拦（它正是
+// 置位依据），照常送达配对 QGC；③ 置位后 QGC 加密心跳被拦；④ 拦截不得破坏路由状态
+// ——该 PX4 加密下行仍须送达配对 QGC；⑤ 回待命复位后加密心跳恢复放行（否则任务结束后
+// 新会话的第一条上行若恰是心跳，该会话永远建不起来）。
+func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
+	node, m, stop := newServer(t, "3354")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3354")
+	px4 := connectPeer(t, node, "3354")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：QGC 登记 + PX4 明文待命心跳（未握手）
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	ef := expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出，消费
+	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
+
+	// ---- 格 1「未握手」：QGC 加密 GCS 心跳必须放行 ----
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(1)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(1), frameCounter(ef))
+
+	// ---- 格 2「PX4 发加密心跳 ⇒ 握手完成」：该帧自身不拦，照常送达配对 QGC ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint64(2), frameCounter(ef))
+
+	// ---- 格 3「已握手」：QGC 加密 GCS 心跳被拦截，不再抵达 PX4 ----
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(5)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// ---- 格 4「拦截不破坏路由状态」：该 PX4 加密下行仍须送达配对 QGC ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(8)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint64(8), frameCounter(ef))
+
+	// ---- 格 5「回待命复位」：加密心跳恢复放行 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出，消费
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(7), frameCounter(ef))
+}
+
+// TestBlockedHeartbeatDoesNotAdvanceWatermark 守 processEncrypted 上行分支中拦截点的
+// **位置**：必须早于 `m.lastNonce[*nk] = counter`（§3.1「被拦截/忽略的帧不推进防重放
+// 水位」；2026-09-27 用户要求「避免心跳对 lastNonce 的影响」）。
+//
+// 判定力来自「把被拦心跳的 counter 取成区间上界」：上行水位先由一条普通上行推到 1，
+// 被拦心跳 counter=5，随后一条普通上行 counter=3。若心跳推进了水位（=5），3<=5 会被
+// 边缘判重**静默丢弃**（链路层表现为「建链成功却控制不了飞机」）；本实现拦截即返回，
+// 水位停在 1，3 正常放行。拦截点若写在配对刷新之前（水位写入之后），本用例必红。
+func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
+	node, m, stop := newServer(t, "3355")
+	defer stop()
+
+	qgc := connectPeer(t, node, "3355")
+	px4 := connectPeer(t, node, "3355")
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：登记 + PX4 待命心跳 + 一条普通加密上行（写上行水位 1）
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	expectFrame(t, px4, 1*time.Second) // 消费
+
+	// PX4 加密心跳 ⇒ 握手完成（置位）
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	expectFrame(t, qgc, 1*time.Second) // 消费
+
+	// 已握手：QGC 加密心跳 counter=5 被拦（不得抵达 PX4）
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(5)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// 水位必须仍停在 1：counter=3 放行（若被推高到 5，此处判重丢弃 → 超时）
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(3), frameCounter(ef))
 }
