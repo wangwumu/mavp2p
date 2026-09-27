@@ -1,7 +1,6 @@
 package fifofilter_test
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gomavlib/v4"
 	"github.com/bluenviron/gomavlib/v4/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v4/pkg/frame"
 	"github.com/stretchr/testify/require"
@@ -69,19 +67,17 @@ func TestFilterFIFO(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send a matching frame (HEARTBEAT, ID=0)
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 1,
-			SystemID:       1,
-			ComponentID:    1,
-			Message: &common.MessageHeartbeat{
-				Type:           common.MAV_TYPE_GCS,
-				Autopilot:      common.MAV_AUTOPILOT_INVALID,
-				SystemStatus:   4,
-				MavlinkVersion: 3,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 1,
+		SystemID:       1,
+		ComponentID:    1,
+		Message: &common.MessageHeartbeat{
+			Type:           common.MAV_TYPE_GCS,
+			Autopilot:      common.MAV_AUTOPILOT_INVALID,
+			SystemStatus:   4,
+			MavlinkVersion: 3,
 		},
+		Checksum: 0,
 	})
 
 	// Wait for reader to receive data
@@ -134,19 +130,17 @@ func TestFilterFallback(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send a matching frame (HEARTBEAT, ID=0) - should fall back to file
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 2,
-			SystemID:       2,
-			ComponentID:    2,
-			Message: &common.MessageHeartbeat{
-				Type:           common.MAV_TYPE_GCS,
-				Autopilot:      common.MAV_AUTOPILOT_INVALID,
-				SystemStatus:   4,
-				MavlinkVersion: 3,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 2,
+		SystemID:       2,
+		ComponentID:    2,
+		Message: &common.MessageHeartbeat{
+			Type:           common.MAV_TYPE_GCS,
+			Autopilot:      common.MAV_AUTOPILOT_INVALID,
+			SystemStatus:   4,
+			MavlinkVersion: 3,
 		},
+		Checksum: 0,
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -197,19 +191,17 @@ func TestFilterNoMatch(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send a non-matching frame (HEARTBEAT, ID=0, not in config)
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 3,
-			SystemID:       3,
-			ComponentID:    3,
-			Message: &common.MessageHeartbeat{
-				Type:           common.MAV_TYPE_GCS,
-				Autopilot:      common.MAV_AUTOPILOT_INVALID,
-				SystemStatus:   4,
-				MavlinkVersion: 3,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 3,
+		SystemID:       3,
+		ComponentID:    3,
+		Message: &common.MessageHeartbeat{
+			Type:           common.MAV_TYPE_GCS,
+			Autopilot:      common.MAV_AUTOPILOT_INVALID,
+			SystemStatus:   4,
+			MavlinkVersion: 3,
 		},
+		Checksum: 0,
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -279,47 +271,41 @@ func TestFilterMultipleMessageIDs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send HEARTBEAT (ID=0) - should go to FIFO
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 10,
-			SystemID:       10,
-			ComponentID:    10,
-			Message: &common.MessageHeartbeat{
-				Type:           common.MAV_TYPE_GCS,
-				Autopilot:      common.MAV_AUTOPILOT_INVALID,
-				SystemStatus:   4,
-				MavlinkVersion: 3,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 10,
+		SystemID:       10,
+		ComponentID:    10,
+		Message: &common.MessageHeartbeat{
+			Type:           common.MAV_TYPE_GCS,
+			Autopilot:      common.MAV_AUTOPILOT_INVALID,
+			SystemStatus:   4,
+			MavlinkVersion: 3,
 		},
+		Checksum: 0,
 	})
 
 	// Send SYS_STATUS (ID=1) - should also go to FIFO
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 11,
-			SystemID:       10,
-			ComponentID:    10,
-			Message: &common.MessageSysStatus{
-				OnboardControlSensorsPresent: 1,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 11,
+		SystemID:       10,
+		ComponentID:    10,
+		Message: &common.MessageSysStatus{
+			OnboardControlSensorsPresent: 1,
 		},
+		Checksum: 0,
 	})
 
 	// Send a non-matching frame (ATTITUDE, ID=30) - should be ignored
-	m.ProcessFrame(&gomavlib.EventFrame{
-		Frame: &frame.V2Frame{
-			SequenceNumber: 12,
-			SystemID:       10,
-			ComponentID:    10,
-			Message: &common.MessageAttitude{
-				Roll:  1.0,
-				Pitch: 2.0,
-				Yaw:   3.0,
-			},
-			Checksum: 0,
+	m.ProcessFrame(&frame.V2Frame{
+		SequenceNumber: 12,
+		SystemID:       10,
+		ComponentID:    10,
+		Message: &common.MessageAttitude{
+			Roll:  1.0,
+			Pitch: 2.0,
+			Yaw:   3.0,
 		},
+		Checksum: 0,
 	})
 
 	var received []byte
@@ -334,9 +320,23 @@ func TestFilterMultipleMessageIDs(t *testing.T) {
 
 	require.NotEmpty(t, received, "FIFO reader should have received data")
 
-	// Both matching frames should be in the output (two V2 magic bytes 0xFD)
-	count := bytes.Count(received, []byte{0xFD})
-	require.Equal(t, 2, count, "should contain exactly two V2 frames (HEARTBEAT and SYS_STATUS)")
+	// 逐条走 tlog 流（每条 = 8B 时间戳 + V2 帧），断言**走出来的 msgID 序列**。
+	//
+	// ❗不要退回 `bytes.Count(received, []byte{0xFD})`：那只数「字节值恰为 0xFD」的位置，
+	// 而每条记录前 8 字节是实时时间戳（µs），其低位字节偶尔就是 0xFD ⇒ 计数虚高、测试
+	// 随机变红（实测 `go test ./...` 6 次里 1 次、只跑本包 8 次里 1 次，与 2×4/256 ≈ 3%
+	// 的估计吻合；失败形状是 expected 2 / actual 3）。改用 msgID 序列后判据是确定的，
+	// 且顺带钉住「恰好这两条、且按序」。
+	var msgIDs []uint32
+	for off := 0; off+18 <= len(received); {
+		require.Equal(t, byte(0xFD), received[off+8], "tlog 记录应以 V2 帧魔数开头")
+		payloadLen := int(received[off+9])
+		msgIDs = append(msgIDs, uint32(received[off+15])|
+			uint32(received[off+16])<<8|uint32(received[off+17])<<16)
+		off += 8 + 10 + payloadLen + 2 // 8B 时间戳 + 10B 帧头 + payload + 2B CRC
+	}
+	require.Equal(t, []uint32{0, 1}, msgIDs,
+		"FIFO 里应恰好是白名单内的两条（HEARTBEAT=0、SYS_STATUS=1），且按序")
 
 	// Non-matching frame should not be in fallback
 	info, err := os.Stat(fallbackPath)

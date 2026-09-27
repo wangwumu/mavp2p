@@ -7,13 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/bluenviron/gomavlib/v4"
 	"github.com/bluenviron/gomavlib/v4/pkg/dialect"
 	"github.com/bluenviron/gomavlib/v4/pkg/frame"
 	"github.com/bluenviron/gomavlib/v4/pkg/tlog"
@@ -26,6 +26,11 @@ const (
 	queueSize = 128
 	// FIONREAD is not exported by golang.org/x/sys/unix for all architectures.
 	fionread = 0x541B
+	// 管理出口写失败的日志节流窗口。
+	mgmtErrLogInterval = 5 * time.Second
+	// 管理出口单次写的上界。UDP send buffer 满时 Write 会**等待空间**，不设上界就会把
+	// 本 goroutine —— 同时也是 FIFO/fallback 的唯一消费者 —— 一起卡住。
+	mgmtWriteTimeout = 200 * time.Millisecond
 )
 
 // Manager is a FIFO-based Mavlink message filter.
@@ -36,6 +41,14 @@ type Manager struct {
 	FifoPath     string
 	ConfigPath   string
 	FallbackPath string
+	// MgmtEndpoint 管理出口：写 FIFO 的同时，用 UDP 把**同一份报文**镜像到该
+	// ip:port。空串表示不启用。
+	//
+	// 规范 10_deviceID与payload加密公共规范.md 附录 A.1 里确有 MANAGEMENT_ENDPOINT
+	// 这一项，但它被标注为「待定……不在本协议范围，由后端管理系统单独定义」（§3.2.5）
+	// ——本字段的报文格式（8B 时间戳 + 帧字节，与 FIFO 逐字节相同）是本仓库自定的
+	// 约定，不是规范给定的。
+	MgmtEndpoint string
 
 	// private
 	messageIDs   map[uint32]struct{}
@@ -45,7 +58,13 @@ type Manager struct {
 	fifoFd       *os.File
 	fallbackFile *os.File
 	fallbackTlog *tlog.Writer
+	mgmtConn     *net.UDPConn
 	chEntry      chan *tlog.Entry
+
+	// 管理出口写失败的日志节流（UDP 无连接，对端不在时 connected socket 会持续
+	// 返回 ECONNREFUSED，而帧率可达 20Hz，不节流会刷屏）。
+	mgmtErrAt  time.Time
+	mgmtErrMsg string
 }
 
 // Initialize initializes the Manager.
@@ -100,10 +119,27 @@ func (m *Manager) Initialize() error {
 		return fmt.Errorf("failed to init fallback tlog: %w", err)
 	}
 
-	// 7. Allocate buffered channel
+	// 7. 管理出口（预留 ip+port）：与 FIFO 并行的 UDP 镜像。空 = 关闭。
+	// 解析失败必须在这里报错——配置写错要当场暴露，不能静默降级成「没有下游」。
+	if m.MgmtEndpoint != "" {
+		addr, err := net.ResolveUDPAddr("udp", m.MgmtEndpoint)
+		if err != nil {
+			// 第 5/6 步已开出 fifoFd / fallbackFile；此处返回错误会让调用方放弃本
+			// Manager，两个 fd 无人再关（run() 尚未启动，cleanup 不会替它们兜底）。
+			m.cleanup()
+			return fmt.Errorf("failed to resolve mgmt endpoint %q: %w", m.MgmtEndpoint, err)
+		}
+		m.mgmtConn, err = net.DialUDP("udp", nil, addr)
+		if err != nil {
+			m.cleanup()
+			return fmt.Errorf("failed to dial mgmt endpoint %q: %w", m.MgmtEndpoint, err)
+		}
+	}
+
+	// 8. Allocate buffered channel
 	m.chEntry = make(chan *tlog.Entry, queueSize)
 
-	// 8. Spawn background goroutine
+	// 9. Spawn background goroutine
 	m.Wg.Add(1)
 	go m.run()
 
@@ -166,6 +202,17 @@ func (m *Manager) handleEntry(entry *tlog.Entry) error {
 	binary.BigEndian.PutUint64(ts[:], uint64(entry.Time.UnixMicro()))
 	tlogData := append(ts[:], frameBytes...)
 
+	// 管理出口镜像：与 FIFO 并行发同一份 tlogData。UDP 是尽力而为，失败只记日志
+	// （并节流），绝不影响下面的 FIFO / fallback 路径。
+	if m.mgmtConn != nil {
+		// 有界写：见 mgmtWriteTimeout 的说明——超时即放弃这一份镜像、继续走 FIFO，
+		// 保住「管理出口绝不影响 FIFO/fallback」这条契约。
+		_ = m.mgmtConn.SetWriteDeadline(time.Now().Add(mgmtWriteTimeout))
+		if _, err := m.mgmtConn.Write(tlogData); err != nil {
+			m.logMgmtErr(err)
+		}
+	}
+
 	// Try to write to FIFO
 	if err := m.writeToFifo(tlogData); err != nil {
 		// FIFO unavailable or full — fall back to .tlog file.
@@ -224,11 +271,35 @@ func (m *Manager) fifoHasSpace(frameSize int) bool {
 	return available >= frameSize
 }
 
-// ProcessFrame processes a frame from the event loop.
-// It checks if the message ID is in the allowed set and, if so,
-// enqueues it for writing to the FIFO (or fallback file).
-func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
-	msgID := evt.Message().GetID()
+// logMgmtErr 节流打印管理出口写失败：同一错误在 mgmtErrLogInterval 内只打一次。
+func (m *Manager) logMgmtErr(err error) {
+	msg := err.Error()
+	if msg == m.mgmtErrMsg && time.Since(m.mgmtErrAt) < mgmtErrLogInterval {
+		return
+	}
+	m.mgmtErrMsg = msg
+	m.mgmtErrAt = time.Now()
+	log.Printf("WARN: fifofilter: mgmt endpoint write failed: %s", msg)
+}
+
+// ProcessFrame 处理一个**已通过会话路由全部过滤**的帧，由 messageman.Manager 经
+// FrameSink 注入。本组件只负责最后一层筛选：哪些 msgID 需要送到下游。
+//
+// 注入点有两处，都在 messageman 的全部早退分支之后：
+//   - processEncrypted 末尾——加密下行帧，已过防重放 + 方向 + px4Map 命中；
+//   - processStandbyHeartbeat 末尾——PX4 明文待命心跳（msgID=0）。这一路**不走**
+//     processEncrypted，因而没有防重放、也不查 px4Map：它由「PX4 段 deviceID +
+//     msgID 0 + payload<28」的形态直接确定。⇒ 对这类帧，**白名单是唯一的闸**，
+//     过滤配置漏掉 0 会让 data_writer 收不到无人机在线状态（§3.2.5 要求 FIFO 必须
+//     含明文待命心跳，故默认配置应含 0）。
+//
+// 改前它是 main.go 事件循环里的平级旁路，绕过全部过滤——QGC 上行的加密心跳照样被
+// 写进 FIFO，该帧随后在 data_writer 推进其**当时的**单水位判重，把下行遥测饿死
+// （2026-09-27 云端实测零入库）。那层判重已于 2026-09-28 按 §2.6「data_writer 例外」
+// 删除，故今天再走旁路不会重现同一症状——这正是本组件不能靠「下游反正会拦」自证清白
+// 的原因：注入点与白名单都得自己守住，依据是 §3.2.5 对 FIFO 内容的定义。
+func (m *Manager) ProcessFrame(fr frame.Frame) {
+	msgID := fr.GetMessage().GetID()
 	if _, ok := m.messageIDs[msgID]; !ok {
 		return
 	}
@@ -236,7 +307,7 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 	select {
 	case m.chEntry <- &tlog.Entry{
 		Time:  time.Now(),
-		Frame: evt.Frame,
+		Frame: fr,
 	}:
 	case <-m.Ctx.Done():
 	default:
@@ -245,6 +316,9 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 }
 
 func (m *Manager) cleanup() {
+	if m.mgmtConn != nil {
+		m.mgmtConn.Close()
+	}
 	if m.fifoFd != nil {
 		m.fifoFd.Close()
 	}

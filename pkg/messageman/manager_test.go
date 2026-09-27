@@ -165,11 +165,17 @@ func encryptedNonHeartbeatPayload(counter uint64) []byte {
 }
 
 // frameCounter 读取帧 payload 明文前 8 字节 counter（加密帧）。
-func frameCounter(ef *gomavlib.EventFrame) uint64 {
-	if raw, ok := ef.Frame.GetMessage().(*message.MessageRaw); ok && len(raw.Payload) >= 8 {
-		return binary.BigEndian.Uint64(raw.Payload[:8])
-	}
-	return 0
+//
+// 读不出来一律 fail-fast，**不返回 0**：返回 0 会让「帧类型不符 / payload 太短」
+// 这种夹具或实现故障伪装成「counter 就是 0」——断言照样红，但红出来的信息把排查
+// 引向错误方向（去找谁发了 counter=0 的帧）。与 main_test.go 的同名 helper 同形。
+func frameCounter(t *testing.T, ef *gomavlib.EventFrame) uint64 {
+	t.Helper()
+
+	raw, ok := ef.Frame.GetMessage().(*message.MessageRaw)
+	require.True(t, ok, "空 dialect 下应收到 MessageRaw")
+	require.GreaterOrEqual(t, len(raw.Payload), 8, "加密帧至少含 8 字节 counter")
+	return binary.BigEndian.Uint64(raw.Payload[:8])
 }
 
 // registrationPayload 构造 80005 payload：deviceID_num(1B) + deviceID 集合（4B 大端）。
@@ -329,7 +335,7 @@ func TestPX4SocketIDDrift(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
 	ef = expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(2), frameCounter(ef))
+	require.Equal(t, uint64(2), frameCounter(t, ef))
 
 	// PX4 重连：新连接（channel B）模拟 NAT 重建后 socketID 漂移。
 	px4b := connectPeer(t, node, "3349")
@@ -337,19 +343,19 @@ func TestPX4SocketIDDrift(t *testing.T) {
 	// §3.2.1 核心规则：按帧头 deviceID 刷新 socketID 后，仍应转发给配对 QGC。
 	ef = expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(4), frameCounter(ef))
+	require.Equal(t, uint64(4), frameCounter(t, ef))
 
 	// 漂移后继续下行（counter=6）→ 配对表 PX4 侧已刷新，持续定向可达
 	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
 	ef = expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(6), frameCounter(ef))
+	require.Equal(t, uint64(6), frameCounter(t, ef))
 
 	// 漂移后上行：px4Map.channel 已刷新到 channel B → QGC 加密上行路由到 px4b
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
 	ef = expectFrame(t, px4b, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(3), frameCounter(ef))
+	require.Equal(t, uint64(3), frameCounter(t, ef))
 
 	// 防重放 × 漂移：nonceKey 按 deviceID×方向、不随 channel 变；漂移后重放 counter=4 应丢弃
 	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
@@ -395,7 +401,7 @@ func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
 	ef = expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(3), frameCounter(ef))
+	require.Equal(t, uint64(3), frameCounter(t, ef))
 }
 
 // TestStandbyClearRequiresEncryptedSession 覆盖 §3.2.2 步骤 10 的前提条件。
@@ -431,7 +437,7 @@ func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
 	ef := expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(2), frameCounter(ef))
+	require.Equal(t, uint64(2), frameCounter(t, ef))
 
 	// ---- 格 2「任务结束回退」：下行水位存在 → 待命心跳必须清除配对 ----
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
@@ -448,7 +454,7 @@ func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
 	ef = expectFrame(t, qgc, 1*time.Second) // 配对仍存活 → 仍送达
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(6), frameCounter(ef))
+	require.Equal(t, uint64(6), frameCounter(t, ef))
 }
 
 // TestStandbyClearResetsUplinkWatermark 守 processStandbyHeartbeat 中无条件的
@@ -493,7 +499,7 @@ func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
 	// 上行必须被转发：水位若残留（1001 > 3）则在此超时
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
 	ef := expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint64(3), frameCounter(ef))
+	require.Equal(t, uint64(3), frameCounter(t, ef))
 }
 
 // TestStandbyClearScopedToThatPX4 守 processStandbyHeartbeat 中的
@@ -539,7 +545,7 @@ func TestStandbyClearScopedToThatPX4(t *testing.T) {
 	// B 的配对必须存活：其加密下行仍应送达 QGC（被连带清掉则在此超时）
 	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(12)))
 	ef := expectFrame(t, qgc, 1*time.Second)
-	require.Equal(t, uint64(12), frameCounter(ef))
+	require.Equal(t, uint64(12), frameCounter(t, ef))
 }
 
 // TestGCSHeartbeatBlockedAfterHandshake 覆盖 §2.5 加密心跳拦截：
@@ -575,12 +581,12 @@ func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(1)))
 	ef = expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(1), frameCounter(ef))
+	require.Equal(t, uint64(1), frameCounter(t, ef))
 
 	// ---- 格 2「PX4 发加密心跳 ⇒ 握手完成」：该帧自身不拦，照常送达配对 QGC ----
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
 	ef = expectFrame(t, qgc, 1*time.Second)
-	require.Equal(t, uint64(2), frameCounter(ef))
+	require.Equal(t, uint64(2), frameCounter(t, ef))
 
 	// ---- 格 3「已握手」：QGC 加密 GCS 心跳被拦截，不再抵达 PX4 ----
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(5)))
@@ -589,14 +595,14 @@ func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
 	// ---- 格 4「拦截不破坏路由状态」：该 PX4 加密下行仍须送达配对 QGC ----
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(8)))
 	ef = expectFrame(t, qgc, 1*time.Second)
-	require.Equal(t, uint64(8), frameCounter(ef))
+	require.Equal(t, uint64(8), frameCounter(t, ef))
 
 	// ---- 格 5「回待命复位」：加密心跳恢复放行 ----
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
 	expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出，消费
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
 	ef = expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint64(7), frameCounter(ef))
+	require.Equal(t, uint64(7), frameCounter(t, ef))
 }
 
 // TestBlockedHeartbeatDoesNotAdvanceWatermark 守 processEncrypted 上行分支中拦截点的
@@ -634,7 +640,7 @@ func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
 	// 水位必须仍停在 1：counter=3 放行（若被推高到 5，此处判重丢弃 → 超时）
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
 	ef := expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint64(3), frameCounter(ef))
+	require.Equal(t, uint64(3), frameCounter(t, ef))
 }
 
 // TestNonHeartbeatEncryptedUplinkNotBlocked 守拦截判据的 **msgID 维度**：置位后只拦
@@ -669,7 +675,7 @@ func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedNonHeartbeatPayload(5)))
 	ef := expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
-	require.Equal(t, uint64(5), frameCounter(ef))
+	require.Equal(t, uint64(5), frameCounter(t, ef))
 }
 
 // TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark 守复位点的**无条件性**：
@@ -709,5 +715,5 @@ func TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark(t *testing.T) {
 	// 复位后：QGC 的加密心跳必须恢复放行
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
 	ef := expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint64(7), frameCounter(ef))
+	require.Equal(t, uint64(7), frameCounter(t, ef))
 }

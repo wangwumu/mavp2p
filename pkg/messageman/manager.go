@@ -82,12 +82,30 @@ type nonceKey struct {
 	odd      bool
 }
 
+// FrameSink 接收「已通过会话路由全部过滤」的**下行帧副本**（FIFO / 管理出口）。
+//
+// 契约：只喂**过滤后**的帧——即已经过边缘防重放、已命中 px4Map、已确认为下行的
+// 帧，外加 PX4 的明文待命心跳（规范 §3.2.5：FIFO 内容＝原样加密帧＋明文待命心跳）。
+// QGC 上行一律不得喂入，尤其是它的加密 GCS 心跳。禁令的依据是 §3.2.5 对 FIFO 内容
+// 的定义（QGC 指令不属其中），**不是**下游的某个具体机制——这一点在 2026-09-28 之后
+// 尤其要照字面读：那次云端 data_writer 遥测零入库，当时的原因是该侧还有单水位判重、
+// 被 1Hz 上行心跳接管后把下行饿死；**那层判重已按 §2.6「data_writer 例外」删除**
+// （用户裁定），所以今天再误喂不会再重现同一个症状，而禁令依然成立。
+//
+// 由 main.go 注入（改前 FIFO 曾是事件循环里的平级旁路，绕过了本管理器的全部
+// 过滤）；nil 表示无下游。须在首次 ProcessFrame 之前设置。
+type FrameSink interface {
+	ProcessFrame(fr frame.Frame)
+}
+
 // Manager 是有状态会话路由器。
 type Manager struct {
 	Ctx context.Context
 	Wg  *sync.WaitGroup
 	Config
 	Node *gomavlib.Node
+	// Sink 过滤后下行帧的下游出口（FIFO / 管理出口）；nil 表示不接。
+	Sink FrameSink
 
 	mu        sync.Mutex
 	px4Map    map[uint32]*px4Entry            // PX4 映射表（deviceID → socketID）
@@ -334,10 +352,12 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 	// 水位照清，与配对是两件事（§2.5：任务结束 PX4 软重置**两个方向**的 lastNonce 为
 	// unset，奇/偶各一条；新任务 QGC 取随机 62 位奇数起点）。若 mavp2p 不清，新 QGC 随机
 	// 起点若低于旧任务水位会被边缘判重误杀（≈50% 概率阻塞新任务上行，直到 counter 追平）。
-	// 清后仅重开防重放窗口（协议 §2.5「重启边界」已接受的残余风险，权威防重放在解密层）。
+	// 清后仅重开防重放窗口（协议 §2.5「重启边界」已接受的残余风险）。
+	// ❗ 2026-09-28 起**下游不再兜底**：data_writer 已按 §2.6「data_writer 例外」删除判重
+	// （用户裁定），本组件的边缘防重放是这条链路上唯一的判重。故下面这个窗口要照字面读。
 	// 注：本清除无前置条件，故在握手窗口（见上方「水位缺失」第二种情形）会连带清掉刚写入的
 	// 上行水位，使该会话第一条上行可被重放一次（实测：无该次心跳时重放被拦、有则放行）。
-	// 同样由解密方的权威防重放兜住；下一条上行即重新写入水位，窗口为一条上行帧的间隔。
+	// 下一条上行即重新写入水位，窗口为一条上行帧的间隔。
 	delete(m.lastNonce, nkUp)
 	delete(m.lastNonce, nkDown)
 	// 锁内收集在线 QGC 快照
@@ -353,13 +373,19 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 			m.Node.WriteFrameTo(ch, fr) //nolint:errcheck
 		}
 	}
-	// FIFO 副本由 fifoFilter（主循环）按 msgID 白名单独立处理
+	// 下游副本（规范 §3.2.5：FIFO 内容含明文待命心跳）。落点在全部过滤之后：
+	// 本函数只处理 PX4 段 deviceID 的 9B 明文心跳，QGC 的心跳到不了这里。
+	if m.Sink != nil {
+		m.Sink.ProcessFrame(fr)
+	}
 }
 
 // processEncrypted 处理加密任务帧（§3.2.2 步骤 3/4/8）。
 func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame.Frame) {
 	// 边缘防重放（§3.1）：读 payload 明文 counter（前 8 字节），按 deviceID×方向 判重。
-	// 尽力而为、不认证；权威防重放在各解密方。counter 为 0 或取不到则不判。
+	// 尽力而为、不认证；端到端的权威判重在各**解密方**（PX4 / QGC 各自维护）。
+	// ❗ data_writer 不在其中：它 2026-09-28 起按 §2.6「data_writer 例外」删除了判重
+	// （用户裁定）⇒ 对 FIFO 这条消费路径，本函数就是唯一的一道。counter 为 0 或取不到则不判。
 	// 注意：lastNonce 的写入延后到「确认本帧会被路由」之后——被拦截/忽略的帧不推进
 	// 防重放水位，避免未登记 QGC 上行（被忽略）推进奇数水位、误杀后续合法上行。
 	// （下行帧即便无配对接收者，也会因刷新状态而推进水位。）
@@ -523,7 +549,11 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 			m.Node.WriteFrameTo(qgc, fr) //nolint:errcheck
 		}
 	}
-	// FIFO 副本由 fifoFilter（主循环）按 msgID 白名单独立处理
+	// 下游副本：落点在全部过滤之后（防重放已判、px4Map 已命中、方向已确认为下行）；
+	// QGC 上行在此之前的分支已各自 return，到不了这里。
+	if m.Sink != nil {
+		m.Sink.ProcessFrame(fr)
+	}
 }
 
 // ProcessChannelClose 处理 EventChannelClose：清理与该 channel 关联的全部状态。

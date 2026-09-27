@@ -160,6 +160,7 @@ var cli struct {
 	FifoPath           string        `default:"/tmp/mavp2p-filter.fifo"`
 	FifoConfig         string        `default:"../filter.yaml"`
 	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
+	FifoMgmtEndpoint   string        `help:"管理出口：写 FIFO 的同时用 UDP 把同一份报文镜像到该 ip:port。报文格式＝FIFO 那份（8B 时间戳+帧字节），是本仓库自定的约定；规范附录 A.1 的 MANAGEMENT_ENDPOINT 被标注为待定、不在协议范围。空=关闭，须同时开 --fifo-enable。"`
 	GCSDeviceIDMax     uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
 	MaxQGCLinkedPX4    int           `help:"单 QGC 最多关联 PX4 数量上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）" default:"16"`
 	MapTTL             time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
@@ -237,6 +238,16 @@ func newProgram(args []string) (*program, error) {
 	if len(os.Args) <= 1 {
 		kongCtx.PrintUsage(false) //nolint:errcheck
 		os.Exit(1)
+	}
+
+	// `--fifo-mgmt-endpoint` 依附于 `--fifo-enable` 这个总开关，单独给出它是**静默
+	// no-op**：程序照常启动、不建 FIFO、不镜像、零提示，配错的人要等到下游一直收不到
+	// 数据才发现。与 fifofilter.Initialize 第 7 步同一原则（配置写错要当场暴露，不能
+	// 静默降级成「没有下游」），故在**建立任何资源之前**直接拒绝，省掉一路清理。
+	if cli.FifoMgmtEndpoint != "" && !cli.FifoEnable {
+		return nil, fmt.Errorf(
+			"--fifo-mgmt-endpoint 依附于 --fifo-enable，单独给出不会生效（不建 FIFO、不镜像）；" +
+				"请同时加 --fifo-enable，或去掉 --fifo-mgmt-endpoint")
 	}
 
 	endpointConfs, err := generateEndpointConfs(cli.Endpoints)
@@ -335,6 +346,7 @@ func newProgram(args []string) (*program, error) {
 			FifoPath:     cli.FifoPath,
 			ConfigPath:   cli.FifoConfig,
 			FallbackPath: cli.FifoFallbackPath,
+			MgmtEndpoint: cli.FifoMgmtEndpoint,
 		}
 		err = p.fifoFilter.Initialize()
 		if err != nil {
@@ -343,6 +355,13 @@ func newProgram(args []string) (*program, error) {
 			p.node.Close()
 			return nil, err
 		}
+		// 下游出口接在会话路由器**之后**：FIFO 只收「已通过防重放、已确认为下行、
+		// 已命中 px4Map」的帧，外加 PX4 明文待命心跳。改前它是事件循环里的平级旁路，
+		// 会连 QGC 上行的加密心跳一起写进 FIFO——那帧在 2026-09-27 曾把 data_writer
+		// **当时的**单水位判重抬起来、饿死下行遥测（实测零入库）；那层判重已按 §2.6 删除，
+		// 所以这条接线今天的依据是 §3.2.5 对 FIFO 内容的定义，不是「下游会拦」。
+		// 注入点必须早于 `go p.run()`（事件循环首次 ProcessFrame 之前）。
+		p.messageMan.Sink = p.fifoFilter
 	}
 
 	if cli.Quiet {
@@ -402,9 +421,8 @@ func (p *program) run() {
 				if p.dumper != nil {
 					p.dumper.ProcessFrame(evt)
 				}
-				if p.fifoFilter != nil {
-					p.fifoFilter.ProcessFrame(evt)
-				}
+				// fifofilter 不在这里调用：它是 messageMan 的 Sink（见上方注入点），
+				// 只能收到已通过会话路由全部过滤的下行帧。
 
 			case *gomavlib.EventParseError:
 				p.errorMan.ProcessError(evt)
