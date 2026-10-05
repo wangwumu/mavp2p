@@ -50,70 +50,89 @@ func downlinkFrame(did uint32, counter uint64) *frame.V2Frame {
 	}
 }
 
-// TestPairExpiresDespitePX4Downlink 钉住「PX4 持续下行不得让配对永不过期」。
+// TestPX4DownlinkKeepsPairButNotFanout 钉住配对表两个时间戳的分工（2026-10-06 恢复）。
 //
-// 改前的实现（2026-10-05 之前）在 PX4 下行分支里刷新该 deviceID 所有配对的 lastSeen，
-// 注释自陈是为「QGC 保活中断但 PX4 持续下行时配对不因 MAP_TTL 静默过期」。后果却是配对
-// **永不过期**：飞机在飞 ⇒ PX4 持续下行 ⇒ 每帧刷活 ⇒ `now.Sub(e.lastSeen) >= ttl` 永不
-// 成立，于是 MAP_TTL 设 30s 还是 60s 都结构性失效，QGC 签出后仍无限期收到该机的加密帧
-// （终端每帧一条 `no key for device … dropping encrypted frame`）。
+// 演进经过，三段都要看，否则很容易把其中一段当成「正确实现」：
 //
-// 修法让配对的保活只剩 QGC 侧两源（80005 周期登记、1Hz 加密上行心跳）；二者在飞时都在、
-// 签出后都不在 —— 这正是「签出 ⇒ 配对按 MAP_TTL 过期」所需的语义。
+//  1. 最初（2026-10-05 之前）PX4 下行刷新配对 lastSeen，**同时**它也是唯一的保活源。后果：
+//     配对永不过期（飞机在飞 ⇒ 每帧刷活），QGC 签出后仍无限期收到该机的加密帧（终端每帧
+//     一条 `no key for device … dropping encrypted frame`）。
+//  2. 2026-10-05（1a6da49）把 PX4 下行那一行删掉，配对保活只剩 QGC 侧两源。签出确实会停，
+//     但**引入了对航线监控员 QGC 的误伤**：QGC 侧一时安静（链路抖动、80005 丢包）配对就被
+//     prune 删掉，必须等下一次 80005 登记（周期 10s）才重建 —— 这段空窗里 PX4 下行扇出为
+//     空，监控员界面「飞机不动了」。
+//  3. 本次（2026-10-06）恢复 PX4 下行对 **lastSeen** 的刷新（配对因此常驻，不再有「删除 →
+//     重建」空窗），同时把「要不要真的投给某个 QGC」拆出来交给 **qgcSeen** 单独决定。
 //
-// 两格判据都不依赖 ticker：第一格直接比对字段，第二格直接调 prune()。
-func TestPairExpiresDespitePX4Downlink(t *testing.T) {
+// 于是两件事分开了：PX4 活跃只能让配对**活着**，不能让一个已经安静的 QGC 继续**收帧**。
+// 本用例四格分别钉住这条分工的四面。
+func TestPX4DownlinkKeepsPairButNotFanout(t *testing.T) {
 	const did = uint32(10000001)
 
 	m := newBareManager()
-	// 2s 而非几十毫秒：第二格要断言「px4Map 那一格**不**被 prune 删掉」（PX4 映射表靠
-	// PX4 自身下行保活是对的），而那是靠「两次调用间隔 < TTL」成立的。取 50ms 这种量级
-	// 会把 CI 上的调度抖动变成假红。
+	// 2s 而非几十毫秒：判据 3 靠「两次调用的间隔 < TTL」成立，取 50ms 这种量级会把 CI 上的
+	// 调度抖动变成假红。
 	m.MapTTL = 2 * time.Second
 
-	// ‼️ QGC 侧 channel 刻意与 PX4 来源 channel 取**同一个**指针。
-	// 下行扇出的结尾是 `if qgc != srcCh { m.Node.WriteFrameTo(...) }`，同指针即扇出为空
-	// ⇒ 本用例不必造真实的 gomavlib.Node（Node 留 nil）。本用例断言的是 lastSeen、不是
-	// 转发，扇出为空对判据没有影响；万一将来判据被改坏到真的去转发，会以 nil 解引用
-	// 崩掉而不是静默通过。
+	// ‼️ 这里刻意**只用一个** channel 指针，同时充当 PX4 下行来源与配对里的 QGC 侧。
+	// 扇出末尾是 `if qgc != srcCh { m.Node.WriteFrameTo(...) }`，同指针即扇出为空 ⇒
+	// processEncrypted 不会碰 m.Node（Node 留 nil，真去转发会 nil 解引用 panic）。这条约束
+	// 换来的是：判据 1、2 的字段观测不会被 panic 打断 —— 变异落在断言上，而不是崩掉整个测试
+	// 二进制（崩了后面那个用例根本不跑，诊断价值就没了）。
+	// 扇出本身由判据 3、4 直接调 fanoutTargets 观测，那正是「算谁该收」与「真去写」分开的
+	// 意义；到那一步，同不同指针已经无所谓。
 	ch := &gomavlib.Channel{}
 
-	// 配对早已过期：lastSeen 取一小时前，远超 2s 的 TTL。
-	stale := time.Now().Add(-time.Hour)
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: stale}
-	pk := pairKey{qgcCh: ch, px4DeviceID: did}
-	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: stale}
+	// 两个时间戳刻意取不同龄期，让判据可以分开观测：
+	//   - lastSeen 一小时前：远超 TTL，若 PX4 不刷它，prune 一定该删。
+	//   - qgcSeen 3×TTL 前：**已超 TTL**（扇出该被挡）但**未到 10×TTL 的兜底闸**（配对不该
+	//     被兜底清理）—— 取同一时刻的话，「配对还在」就分不清是 lastSeen 保住了它还是兜底
+	//     还没触发，判据失去判别力。
+	staleSeen := time.Now().Add(-time.Hour)
+	staleQGC := time.Now().Add(-3 * m.MapTTL)
 
-	// PX4 发来一帧加密下行。改前这里会把 e.lastSeen 刷成 now。
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: staleSeen}
+	pk := pairKey{qgcCh: ch, px4DeviceID: did}
+	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: staleSeen, qgcSeen: staleQGC}
+
+	// PX4 发来一帧加密下行。
 	m.processEncrypted(ch, did, downlinkFrame(did, 2))
 
-	// ---- 第一格：下行**不得**刷新配对 lastSeen ----
+	// ---- 第一格：PX4 下行**恢复**刷新配对 lastSeen（配对存活） ----
 	e, ok := m.pairs[pk]
-	require.True(t, ok, "配对项本身不该被下行帧删掉（本格只钉 lastSeen）")
-	require.Equal(t, stale, e.lastSeen,
-		"PX4 下行刷新了配对 lastSeen ⇒ MAP_TTL 结构性失效：飞机在飞就永不过期，QGC 签出后仍会无限期收帧")
+	require.True(t, ok, "配对项本身不该被下行帧删掉")
+	require.NotEqual(t, staleSeen, e.lastSeen,
+		"PX4 下行没有保活配对 ⇒ 误伤未修复：QGC 侧一时安静就会让配对按 MAP_TTL 被删，"+
+			"要等下一次 80005 登记（周期 10s）才重建，这段空窗里监控员界面数据冻结")
 
-	// ---- 第二格：后果（行为级）—— TTL 已过，prune 必须把配对清掉 ----
-	// 只有第一格的话，证的是「这个字段没被写」，证不了「于是配对真的会过期」。
-	m.prune()
-	_, stillThere := m.pairs[pk]
-	require.False(t, stillThere,
-		"lastSeen 已超 TTL，prune 仍留着该配对 ⇒ 它还会被下行路由命中并转发")
+	// ---- 第二格：但**不得**刷新 qgcSeen（可用性只由 QGC 侧证明） ----
+	require.Equal(t, staleQGC, e.qgcSeen,
+		"PX4 下行刷新了 qgcSeen ⇒ PX4 活跃被当成 QGC 仍在用这台飞机，"+
+			"场地操作员签出后仍会被无限期投喂")
 
-	// ---- 阴性对照：px4Map 那一格应当**存活** ----
-	// 两张表的 lastSeen 语义不同，别混为一谈：PX4 映射表就该靠 PX4 自身下行保活（PX4 真的
-	// 不发了才该消失），配对表才该靠 QGC 侧保活。少了这一格，把「下行不刷任何 lastSeen」
-	// 当成修法也能全绿 —— 而那会让 PX4 一有遥测间隙就被判掉线。
-	require.Len(t, m.px4Map, 1,
-		"PX4 映射表刚被本帧刷新过，不该被 prune 删掉（2s TTL 远大于两次调用的间隔）")
+	// ---- 第三格（行为级）：qgcSeen 已超 TTL ⇒ 扇出必须为空 ----
+	// 只有前两格的话，证的是「这两个字段各自被写/没被写」，证不了「于是真的不发」。
+	require.Empty(t, m.fanoutTargets(did, ch, time.Now()),
+		"qgcSeen 已超 TTL，扇出却仍把该 QGC 算进去 ⇒ 这道门形同虚设，签出方照收不误")
+
+	// ---- 第四格（阳性对照）：qgcSeen 一新鲜，扇出立刻恢复 ----
+	// 少了这一格，「门恒关」（例如把判据写成 <= 或干脆 return nil）也能全绿 —— 而那会让
+	// 正常在飞的 QGC 一帧都收不到。
+	e.qgcSeen = time.Now()
+	require.Equal(t, []*gomavlib.Channel{ch}, m.fanoutTargets(did, ch, time.Now()),
+		"qgcSeen 新鲜却仍不扇出 ⇒ 门装反了，QGC 正常在飞也收不到下行")
+
+	// ---- 阴性对照：别的 deviceID 不得被这帧认领 ----
+	require.Empty(t, m.fanoutTargets(did+1, ch, time.Now()),
+		"扇出按 deviceID 过滤这一层失效：本帧会被投给无关的 QGC")
 }
 
 // TestRegistrationKeepsPairAlive 钉住配对的**保活源**之一：80005 周期登记。
 //
-// 上一格证明了「PX4 下行**不**刷配对 lastSeen」，那个修法把配对的保活全押在 QGC 侧两源上
-// （80005 周期登记、1Hz 加密上行心跳）。本用例钉住其中之一 —— 否则那个修法可以被「顺手
-// 把 processRegistration 里的刷新也删掉」弄成全绿，后果是配对在任务**进行中**也按 MAP_TTL
-// 过期：QGC 还在飞、还在照常登记，却再也收不到这架飞机的下行。
+// 配对的两条命脉都在 QGC 侧（80005 周期登记、1Hz 加密上行心跳）：lastSeen 靠它们存活、
+// qgcSeen 靠它们变新鲜。本用例钉住其中之一 —— 否则「顺手把 processRegistration 里的刷新也
+// 删掉」能弄成全绿，后果是配对在任务**进行中**也按 MAP_TTL 过期：QGC 还在飞、还在照常登记，
+// 却再也收不到这架飞机的下行。
 //
 // 阴性对照不可省：只声明「配对还在」证不了是登记起了作用 —— prune 若因任何原因没在删
 // 东西，阳性判据照样全绿。所以同时放一条**没被声明**的配对进去，它必须被删掉。
@@ -141,8 +160,10 @@ func TestRegistrationKeepsPairAlive(t *testing.T) {
 	m.qgcOnline[ch] = &qgcEntry{lastSeen: stale}
 	aliveKey := pairKey{qgcCh: ch, px4DeviceID: px4Did}
 	otherKey := pairKey{qgcCh: ch, px4DeviceID: other}
-	m.pairs[aliveKey] = &pairEntry{px4Ch: ch, lastSeen: stale}
-	m.pairs[otherKey] = &pairEntry{px4Ch: ch, lastSeen: stale}
+	// qgcSeen 与 lastSeen 取同一龄期：本用例只管「80005 登记能不能救活配对」，不区分两个
+	// 时间戳（那个分工由 TestPX4DownlinkKeepsPairButNotFanout 钉）。
+	m.pairs[aliveKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale}
+	m.pairs[otherKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale}
 
 	// 80005 登记：num=2，声明 px4Did 与 fresh；other 刻意不出现。
 	payload := make([]byte, 1+2*4)

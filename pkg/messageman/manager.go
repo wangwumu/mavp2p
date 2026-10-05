@@ -71,9 +71,21 @@ type pairKey struct {
 }
 
 // pairEntry 配对表项：三元组 (QGC socketID, PX4 deviceID, PX4 socketID)。
+//
+// 两个时间戳分工不同，**别合并**（2026-10-06 改；完整演进时间线见
+// pair_ttl_internal_test.go 的 TestPX4DownlinkKeepsPairButNotFanout）：
+//
+//   - lastSeen：配对的**存活**。QGC 侧两源（80005 登记、加密上行心跳）与 **PX4 加密下行**
+//     都刷新它。PX4 在飞就一直刷 ⇒ 配对常驻，不再有「QGC 侧一时安静 ⇒ 配对被 prune ⇒ 等
+//     下一次 80005 登记（周期 10s）才重建」的空窗 —— 那段空窗期扇出为空，正是航线监控员
+//     QGC 签入后界面数据冻结的成因。
+//   - qgcSeen：配对的**可用性**，只由 QGC 侧两源刷新。扇出下行帧要求它新鲜（prune 另有
+//     一道更宽的兜底闸）。这一格就是「PX4 保活不得延伸到 QGC」的落点：PX4 活跃只能让配对
+//     活着，不能让一个已经安静的 QGC 继续收帧，否则场地操作员签出后会被无限期投喂。
 type pairEntry struct {
 	px4Ch    *gomavlib.Channel
 	lastSeen time.Time
+	qgcSeen  time.Time
 }
 
 // nonceKey 边缘防重放键：deviceID × 方向（上行奇数 / 下行偶数）。
@@ -199,6 +211,19 @@ func (m *Manager) prune() {
 		if now.Sub(e.lastSeen) >= ttl {
 			log.Printf("pair expired: QGC %s <-> PX4 deviceID=%d", k.qgcCh, k.px4DeviceID)
 			delete(m.pairs, k)
+			continue
+		}
+		// 兜底（2026-10-06）：lastSeen 现在会被 PX4 下行持续刷新，所以「QGC 侧彻底消失」这条
+		// 路不能再指望上面的 TTL 清理了。主清理路径是 ProcessChannelClose（channel 关闭即清
+		// 其名下配对），但它有漏——实测 18 开 / 17 闭，差的那一个会让条目跨小时累积；而
+		// pairKey 含 QGC 侧 channel 指针，QGC 端口每漂移一次就多一批，只增不减。
+		// 这里补一道远宽的闸：QGC 侧安静超过 10×TTL 就强制删。
+		// ‼️ 判据必须是 qgcSeen 而**不是** lastSeen——后者被 PX4 刷着，永远到不了这个闸。
+		// 10× 是量级选择：要远大于任何一次 80005 周期（10s）与链路抖动，才不会误杀一个刚要
+		// 恢复的正常配对（那正是本次要修的场景）；又要让死通道的条目不至于长期滞留。
+		if now.Sub(e.qgcSeen) >= 10*ttl {
+			log.Printf("pair reaped (QGC silent): QGC %s <-> PX4 deviceID=%d", k.qgcCh, k.px4DeviceID)
+			delete(m.pairs, k)
 		}
 	}
 	// 空扇出告警节流表随 px4Map 一同回收。它的写入点在 px4Map 命中**之后**（downlink 分支
@@ -302,11 +327,14 @@ func (m *Manager) processRegistration(srcCh *gomavlib.Channel, did uint32, msg m
 		k := pairKey{qgcCh: srcCh, px4DeviceID: d}
 		e, ok := m.pairs[k]
 		if !ok {
-			e = &pairEntry{lastSeen: now}
+			e = &pairEntry{lastSeen: now, qgcSeen: now}
 			m.pairs[k] = e
 			log.Printf("QGC %s registered: linked PX4 deviceID=%d", srcCh, d)
 		} else {
+			// 两个时间戳都刷：80005 是 QGC 侧**唯一**周期性的声明源，既是配对的存活源，
+			// 也是唯一能让 qgcSeen 变新鲜的东西（加密上行是 1Hz，但只在有上行帧时才来）。
 			e.lastSeen = now
+			e.qgcSeen = now
 		}
 		if px4, ok := m.px4Map[d]; ok {
 			e.px4Ch = px4.channel // PX4 已在线 → 补全三元组
@@ -456,11 +484,12 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		pk := pairKey{qgcCh: srcCh, px4DeviceID: did}
 		e, ok := m.pairs[pk]
 		if !ok {
-			m.pairs[pk] = &pairEntry{px4Ch: px4.channel, lastSeen: time.Now()}
+			m.pairs[pk] = &pairEntry{px4Ch: px4.channel, lastSeen: time.Now(), qgcSeen: time.Now()}
 			log.Printf("link established: QGC %s <-> PX4 deviceID=%d (%s)", srcCh, did, px4.channel)
 		} else {
 			e.px4Ch = px4.channel
 			e.lastSeen = time.Now()
+			e.qgcSeen = time.Now()
 		}
 		// 加密心跳拦截（§2.5）：该 PX4 已握手（曾发出加密心跳 ⇒ 加密链路已建成）后，
 		// 不再把 QGC 的加密 GCS 心跳转给它。本位置受两条约束夹定，都不可挪：必须在
@@ -531,25 +560,28 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	// 下行路由判据 `e.px4Ch == srcCh` 靠这里跟上——**这一行不能删**，删了连在飞的飞机
 	// 也会因路由失配收不到帧。
 	//
-	// ‼️ 这里**不刷 lastSeen**（2026-10-05 改）。原实现刷，其注释自陈是为「QGC 保活中断
-	// 但 PX4 持续下行时配对不因 MAP_TTL 静默过期」——但那让配对**永不过期**：飞机在飞
-	// ⇒ PX4 持续下行 ⇒ 每帧刷活 ⇒ `now.Sub(e.lastSeen) >= ttl` 永不成立，于是 MAP_TTL
-	// 无论设 60s 还是 30s 都结构性失效，QGC 签出后仍无限期收帧（终端每帧一条
-	// `no key for device … dropping encrypted frame`）。
-	// 删掉后配对的保活只剩 QGC 侧两源——80005 周期登记与 1Hz 加密上行心跳；
-	// 二者在飞时都在、签出后都不在，这正是「签出 ⇒ 配对按 MAP_TTL 过期」所需的语义。
+	// ‼️ 这里**要刷 lastSeen**（2026-10-06 恢复；2026-10-05 曾删过，见下）。两个字段的分工
+	// 见 pairEntry 的注释，一句话：PX4 下行保活配对的**存活**（lastSeen），但不碰它的
+	// **可用性**（qgcSeen）——投不投给该 QGC 由下方扇出单独判。
+	//
+	// 为什么恢复：删掉之后配对只剩 QGC 侧保活，QGC 一时安静（链路抖动、80005 丢包）就被
+	// prune 删掉，必须等下一次 80005 登记（周期 10s）才重建，这段空窗里扇出为空 —— 航线
+	// 监控员 QGC 签入后「过一会数据不动」正是这么来的。恢复后配对常驻，QGC 侧一有帧到达
+	// 就立刻恢复投递，空窗消失。
+	//
+	// 为什么恢复它不会退回 2026-10-05 要修的那个毛病：那次的问题是「飞机还在飞 ⇒ 地面站
+	// 还在用它」这条错误推理让 `now.Sub(e.lastSeen) >= ttl` 永不成立，签出方因此被无限期
+	// 投喂（终端每帧一条 `no key for device … dropping encrypted frame`）。现在这条推理的
+	// 结论只落在「配对还活着」上，**投递**另由 qgcSeen 把关 —— 已经安静的 QGC 不会被 PX4
+	// 的活跃度续命。
 	for k, e := range m.pairs {
 		if k.px4DeviceID == did {
 			e.px4Ch = srcCh
+			e.lastSeen = now
 		}
 	}
 	// 下行路由：只发给配对的任务 QGC（不扇出），§3.2.2 步骤 4
-	qgcs := make([]*gomavlib.Channel, 0)
-	for k, e := range m.pairs {
-		if k.px4DeviceID == did && e.px4Ch == srcCh {
-			qgcs = append(qgcs, k.qgcCh)
-		}
-	}
+	qgcs := m.fanoutTargets(did, srcCh, now)
 	if nk != nil {
 		m.lastNonce[*nk] = counter
 	}
@@ -573,6 +605,35 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	if m.Sink != nil {
 		m.Sink.ProcessFrame(fr)
 	}
+}
+
+// fanoutTargets 计算本帧加密下行应当投递到的 QGC 通道（调用方须持有 m.mu）。
+//
+// 抽成函数是为了可测：扇出末尾的 `if qgc != srcCh` 会把「QGC 通道恰为 PX4 来源」那种情况
+// 静默吃掉，而那个同指针夹具正是内部用例不造 gomavlib.Node 的前提 —— 判据想在没有 Node 的
+// 情况下观测扇出，就必须把「算谁该收」与「真去写」分开。
+//
+// 两道判据缺一不可：
+//   - 三元组齐备：配对的 deviceID 匹配，且其 px4Ch 就是本帧来源。上方循环已把该 deviceID
+//     名下所有配对的 px4Ch 刷成本帧来源，故这条等价于「该配对指向的就是这台 PX4」。
+//   - qgcSeen 新鲜：QGC 侧（80005 登记 / 加密上行）近期还在声明使用这台飞机。
+//     ‼️ 这一道就是「PX4 保活不得延伸到 QGC」的落点 —— 没有它，PX4 持续下行会把 lastSeen
+//     一直刷新，签出方永远收得到帧（2026-10-05 修的就是这个）。用严格小于：距上次 QGC 侧
+//     证据恰好一个 TTL 即视为过期。
+//     ⚠️ 这**不是** prune 那道闸的补集：prune 里判 `qgcSeen` 的是 **10×TTL** 的兜底闸（配对因此在
+//     QGC 侧安静后还能再存活 9 个 TTL），判 `TTL` 的那句读的是 **lastSeen**（另一个字段，飞机在飞
+//     时被 PX4 下行持续刷新）。两个判据刻意**不**互补，中间那 9 个 TTL 就是「配对活着但不投喂」。
+//     ‼️ **别因为「prune 已经管了」就删掉这一道**：配对的存活由 `lastSeen` 决定，而它被 PX4 刷着
+//     ⇒ 删掉本闸，扇出条件就退化成「配对存在」，签出方重新无限期收帧（2026-10-05 修的就是这个）。
+func (m *Manager) fanoutTargets(did uint32, srcCh *gomavlib.Channel, now time.Time) []*gomavlib.Channel {
+	ttl := m.mapTTL()
+	out := make([]*gomavlib.Channel, 0)
+	for k, e := range m.pairs {
+		if k.px4DeviceID == did && e.px4Ch == srcCh && now.Sub(e.qgcSeen) < ttl {
+			out = append(out, k.qgcCh)
+		}
+	}
+	return out
 }
 
 // ProcessChannelClose 处理 EventChannelClose：清理与该 channel 关联的全部状态。
