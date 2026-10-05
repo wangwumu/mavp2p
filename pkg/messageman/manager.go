@@ -172,7 +172,8 @@ func (m *Manager) run() {
 	}
 }
 
-// prune 清除超过 MAP_TTL 未活跃的映射/在线/配对状态。
+// prune 清除超过 MAP_TTL 未活跃的映射/在线/配对状态，并回收随之失去意义的空扇出告警
+// 节流记录（见函数末那段注释）。
 // lastNonce 不在此清理（每 deviceID×方向仅一条，规模有限；由 PX4 回待命心跳按
 // §2.5 软重置清除，见 processStandbyHeartbeat）。
 func (m *Manager) prune() {
@@ -198,6 +199,17 @@ func (m *Manager) prune() {
 		if now.Sub(e.lastSeen) >= ttl {
 			log.Printf("pair expired: QGC %s <-> PX4 deviceID=%d", k.qgcCh, k.px4DeviceID)
 			delete(m.pairs, k)
+		}
+	}
+	// 空扇出告警节流表随 px4Map 一同回收。它的写入点在 px4Map 命中**之后**（downlink 分支
+	// 先查 px4Map 才可能走到扇出为空那一支）⇒ 这张表记的全是曾经活跃过的 PX4，故
+	// 「不在 px4Map 里」等价于「该 deviceID 的 PX4 已消失」，留着记录没有意义。删掉还更贴合
+	// 节流表本意：该 deviceID 下次出现就是新会话，第一条告警应当立刻打。
+	// ‼️ 必须排在上面 px4Map 的清理**之后** —— 顺序反了的话，本轮刚该消失的 deviceID 此刻
+	// 还在 px4Map 里，它的节流记录就被漏掉，表照旧只增不减。
+	for did := range m.emptyDownlinkLogged {
+		if _, ok := m.px4Map[did]; !ok {
+			delete(m.emptyDownlinkLogged, did)
 		}
 	}
 }
