@@ -515,13 +515,20 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		px4.handshaked = true
 		log.Printf("PX4 handshake complete: deviceID=%d (%s), GCS heartbeats blocked", did, srcCh)
 	}
-	// 刷新该 deviceID 所有配对的 PX4 侧 socketID 与活跃时间，保持三元组一致；
-	// 刷新 lastSeen 使配对保活不只依赖 QGC 80005/上行——QGC 保活中断但 PX4 持续下行时
-	// 配对不会因 MAP_TTL 静默过期（§3.2.3 保活约束）
+	// 同步该 deviceID 所有配对的 PX4 侧 socketID（保持三元组一致）。PX4 重连换 socket 后，
+	// 下行路由判据 `e.px4Ch == srcCh` 靠这里跟上——**这一行不能删**，删了连在飞的飞机
+	// 也会因路由失配收不到帧。
+	//
+	// ‼️ 这里**不刷 lastSeen**（2026-10-05 改）。原实现刷，其注释自陈是为「QGC 保活中断
+	// 但 PX4 持续下行时配对不因 MAP_TTL 静默过期」——但那让配对**永不过期**：飞机在飞
+	// ⇒ PX4 持续下行 ⇒ 每帧刷活 ⇒ `now.Sub(e.lastSeen) >= ttl` 永不成立，于是 MAP_TTL
+	// 无论设 60s 还是 30s 都结构性失效，QGC 签出后仍无限期收帧（终端每帧一条
+	// `no key for device … dropping encrypted frame`）。
+	// 删掉后配对的保活只剩 QGC 侧两源——80005 周期登记与 1Hz 加密上行心跳；
+	// 二者在飞时都在、签出后都不在，这正是「签出 ⇒ 配对按 MAP_TTL 过期」所需的语义。
 	for k, e := range m.pairs {
 		if k.px4DeviceID == did {
 			e.px4Ch = srcCh
-			e.lastSeen = now
 		}
 	}
 	// 下行路由：只发给配对的任务 QGC（不扇出），§3.2.2 步骤 4

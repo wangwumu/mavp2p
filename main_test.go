@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,6 +22,28 @@ const (
 	gcsDeviceID = uint32(10000)    // GCS 段固定值（QGC 登记心跳帧头 deviceID）
 	px4DeviceID = uint32(10000001) // PX4 段 deviceID（>= 1e7）
 )
+
+// TestMain 把配置文件的搜索路径换到一个空目录，**隔离开发机上的用户级配置**。
+//
+// 为什么必须隔离：newProgram 会按 configPaths 读 ~/.config/mavp2p/mavp2p.yaml，那是
+// **不进版本库**的本机文件。本机只要在里面写了 fifo_mgmt_endpoint（本仓库的部署就这么
+// 写），就会撞上「fifo_mgmt_endpoint 依附于 fifo_enable」那道守卫，让 TestProgramEndToEnd
+// 之类的用例**在本机恒红、在 CI 恒绿** —— 红的时候错误信息还指向被测代码，实际根因在
+// 被测代码之外的配置文件里。
+//
+// ‼️ 不能靠 `HOME=` 规避：kong.ExpandPath 走 user.Current()（读 /etc/passwd），不看 $HOME。
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "mavp2p-test-config")
+	if err != nil {
+		panic(err)
+	}
+	// 指向一个**不存在**的文件：加载时静默跳过，等价于「本机没有任何配置文件」。
+	// 要测配置文件本身的用例请自己临时改 configPaths，不要依赖这一份。
+	configPaths = []string{filepath.Join(dir, "mavp2p.yaml")}
+	code := m.Run()
+	os.RemoveAll(dir) // os.Exit 不执行 defer，必须显式清理
+	os.Exit(code)
+}
 
 // newTestPeer 连到 mavp2p 的 TCP server，返回一个「空 dialect + MessageRaw 收发」的对端。
 func newTestPeer(t *testing.T, addr string, sysid, compid byte) *gomavlib.Node {
@@ -260,6 +283,195 @@ func TestProgramMgmtEndpointRequiresFifoEnable(t *testing.T) {
 	require.Error(t, err, "--fifo-mgmt-endpoint 单独给出必须报错，不得静默降级成 no-op")
 	require.Contains(t, err.Error(), "--fifo-enable",
 		"错误信息必须点名它依附的那个开关，否则用户不知道该怎么改")
+}
+
+// swapConfigPaths 临时把配置搜索路径换成一份测试用的 yaml。
+//
+// TestMain 默认把它指向一个**不存在**的文件（隔离开发机的用户级配置），所以凡是要
+// 测配置文件本身的用例都必须自己换一次。它改的是**包级变量**，故只对同包内**串行**
+// 执行的用例安全 —— 本文件所有用例都不调 t.Parallel()，靠的就是这一点。
+func swapConfigPaths(t *testing.T, path string) {
+	t.Helper()
+
+	orig := configPaths
+	configPaths = []string{path}
+	t.Cleanup(func() { configPaths = orig })
+}
+
+// TestProgramConfigEndpointsMalformedStillReported 钉住「配置文件的 endpoints **校验**
+// 不受命令行给没给端点影响」。
+//
+// 要防的形状：把 endpointsFromConfig() 整个关进 `if len(cli.Endpoints) == 0` —— 于是
+// 命令行给了端点时，配置文件里写成标量（漏 `-`）的 endpoints **一个字节都不读**，
+// 校验零报错。这与那个函数自己的立场（「与 Validate 同一个立场：宁可拒绝启动，也不让
+// 一个写错的配置静默退化成『没配』」）直接冲突：立场被调用点的条件短路掉了。
+//
+// ⚠️ 别去 HEAD 里找上面说的「那种写法」——配置加载整块是本仓**未提交**的新特性，
+// HEAD 的 main.go 根本不读配置文件（`git show HEAD:main.go | grep -c yamlConfiguration`
+// = 0，连 endpointsFromConfig/configPaths 这两个符号都不存在）。上面描述的是本特性
+// 开发中的一种写法，不是任何提交过的历史状态。
+//
+// 阴性对照见 TestProgramConfigEndpointsAdopted：形态正确的列表在命令行没给端点时
+// 必须被采用。缺了它，本格可以靠「见配置就报错」蒙混过关。
+func TestProgramConfigEndpointsMalformedStillReported(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+	// 漏了 `-`：YAML 里冒号后无空格 ⇒ 解析成一个标量字符串，不是列表。
+	require.NoError(t, os.WriteFile(cfg, []byte("endpoints: tcps:0.0.0.0:6666\n"), 0o644))
+	swapConfigPaths(t, cfg)
+
+	// 命令行**同时**给了端点。若校验被关进 `if len(cli.Endpoints) == 0`，本格的 err
+	// 会是 nil，且进程照常监听 7777（配置文件里那个坏掉的 endpoints 无人过问）。
+	_, err := newProgram([]string{"tcps:0.0.0.0:7777"})
+	require.Error(t, err, "配置文件里 endpoints 形态写错必须报错，不因命令行给了端点而豁免")
+	require.Contains(t, err.Error(), "必须是列表",
+		"错误信息要指名形态错在哪（漏了 `-`），否则用户只知道『配置坏了』")
+}
+
+// TestProgramConfigRejectsBadKeyOrBareDuration 钉住 yamlResolver.Validate 的两半：
+// key 写错、duration 写成裸数字，都必须在**启动前**拒绝，而不是静默退回默认值。
+//
+// 为什么走 newProgram 而不是直接调 Validate：这两半的价值全在「接没接上」。kong 的
+// Resolver 接口若没人调，Validate 写得再对也拦不住任何东西 —— 把它单独拎出来测，测的是
+// 它的逻辑，测不到它是否活在启动路径上（本仓正是踩过「立场被调用点的条件短路掉」）。
+//
+// 最后一格是阴性对照：形态正确的配置**必须能起来**。缺了它，本用例可以靠「见配置就
+// 报错」蒙混过关 —— 把 Validate 改成无条件 return error，前三格照样全绿。
+func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
+	// 先占一个真实空闲端口：阴性对照那一格会真的把程序起起来。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+	args := []string{"tcps:127.0.0.1:" + itoa(port)}
+
+	for _, tc := range []struct {
+		name    string
+		yaml    string
+		wantSub string // 空 ⇒ 期望**无**错（阴性对照）
+	}{
+		{
+			name:    "连字符原样的 key 不认",
+			yaml:    "map-ttl: 30s\n",
+			wantSub: "无法识别的配置项",
+		},
+		{
+			name:    "末尾的 4 是独立一段，缩写成 px4 不认",
+			yaml:    "max_qgc_linked_px4: 16\n",
+			wantSub: "无法识别的配置项",
+		},
+		{
+			name:    "duration 写裸数字会被 kong 当成纳秒且不报错",
+			yaml:    "map_ttl: 30\n",
+			wantSub: "必须写成带单位的字符串",
+		},
+		{
+			name: "阴性对照：两种正确写法都必须能起来",
+			yaml: "map_ttl: 30s\nmapTtl: 30s\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+			require.NoError(t, os.WriteFile(cfg, []byte(tc.yaml), 0o644))
+			swapConfigPaths(t, cfg)
+
+			p, err := newProgram(args)
+			// ‼️ 前三格在**正确实现**下 p 必为 nil（校验先于起监听），这个 defer 是空转。
+			// 但校验被架空的变异场景里，它们会真的把程序起起来并占住这个端口 —— 不关掉，
+			// 第四格的阴性对照就会以 `bind: address already in use` 红，那个红与判据无关，
+			// 只会掩盖「阴性对照到底有没有判别力」这个信息。
+			if p != nil {
+				defer p.close()
+			}
+			if tc.wantSub == "" {
+				require.NoError(t, err, "形态正确的配置必须能起来：%s", tc.yaml)
+				return
+			}
+			require.Error(t, err, "配置写错必须在启动前拒绝，而不是静默退回默认值：%s", tc.yaml)
+			require.Contains(t, err.Error(), tc.wantSub)
+		})
+	}
+}
+
+// TestProgramConfigEndpointsAdopted 是上一格的阴性对照：命令行**没给**位置参数时，
+// 配置文件里形态正确的列表必须被采用。这正是云端 systemd unit 的用法 —— 该 unit 的
+// ExecStart 里**不含任何 ip:port**（只剩 --fifo-enable / --fifo-path / --fifo-config /
+// --fifo-fallback-path 四个只管「怎么跑」的参数），端点 udps:0.0.0.0:5600 与管理出口
+// fifo_mgmt_endpoint 127.0.0.1:61000 都写在 /opt/uavm/mavp2p.yaml 里，而该 unit 的
+// WorkingDirectory=/opt/uavm 正是配置文件搜索路径的第一项。
+// （2026-10-05 读自 39.97.235.226：/etc/systemd/system/uavm-mavp2p.service 与
+// /opt/uavm/mavp2p.yaml。）
+//
+// ⚠️ 它**不**钉「判据读的是 args 还是 os.Args」：那条判据的两个出口是 exit / 不 exit，
+// 而测试进程的 os.Args 恒非空 ⇒ 两种写法**都不**进 exit 分支，本格在两边都绿。
+// 能区分它的是 TestProgramNoInputsPrintsHelp（走子进程）。
+func TestProgramConfigEndpointsAdopted(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+	require.NoError(t, os.WriteFile(cfg,
+		[]byte("endpoints:\n  - tcps:0.0.0.0:"+itoa(port)+"\n"), 0o644))
+	swapConfigPaths(t, cfg)
+
+	// args 为空：端点只能来自配置文件。判据若误读 os.Args，这里会 PrintUsage+exit(1)，
+	// 直接把测试进程带走（症状是整包 panic，不是本格红）。
+	p, err := newProgram(nil)
+	require.NoError(t, err, "端点只写在配置文件里时，args 为空也必须能起来")
+	defer p.close()
+
+	// 值保真：真连上去，确认监听的就是配置文件里写的那个端口（不是别的来源兜的）
+	peer := newTestPeer(t, "127.0.0.1:"+itoa(port), 2, 3)
+	defer peer.Close()
+	<-peer.Events()
+}
+
+// noInputsEnv 让同一个测试函数在子进程里以「用户啥也没给」的身份再跑一次。
+const noInputsEnv = "MAVP2P_TEST_NO_INPUTS"
+
+// TestProgramNoInputsPrintsHelp 钉住「两个输入源都没给 ⇒ 打印用法并 exit(1)」这条
+// 分支的判据读的是**入参 args**，不是 os.Args。
+//
+// 为什么非走子进程不可 —— 两道原因叠在一起，缺一条都还能同进程测：
+//  1. 这条分支的出口是 os.Exit(1)，同进程内观察不到；
+//  2. 被它拦下的前提正是「args 为空」，而主测试进程的 argv 是 `go test` 自己的（恒非空）
+//     ⇒ 读 os.Args 的版本在这里**永远进不去**这个分支，同进程内无法与正确版本区分。
+//
+// 判据力：把 `len(args) == 0` 改回 `len(os.Args) <= 1`，子进程的 os.Args 非空 ⇒ 不 exit
+// ⇒ 往下走撞上「at least one endpoint is required」，子进程那半边的 t.Fatalf 立即红。
+// 正确实现下子进程 exit(1)，本格绿。
+//
+// ⚠️ 函数名里**刻意不含 "Usage" 这个词**，判据也刻意收紧成 `Usage:`（带冒号）。原因见
+// 下面那句 require.Contains 的注释 —— 这不是洁癖，是本用例第一版真实栽过的坑。
+func TestProgramNoInputsPrintsHelp(t *testing.T) {
+	if os.Getenv(noInputsEnv) == "1" {
+		// 子进程身份：TestMain 已把 configPaths 指向一个不存在的文件，args 也为空
+		// ⇒ 两个输入源都没给 ⇒ 应当 PrintUsage 后 exit(1)，**不会**返回到这里。
+		_, err := newProgram(nil)
+		t.Fatalf("两个输入源都没给时应当 exit(1)，却返回了 err=%v", err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestProgramNoInputsPrintsHelp")
+	cmd.Env = append(os.Environ(), noInputsEnv+"=1")
+	out, err := cmd.CombinedOutput()
+
+	var ee *exec.ExitError
+	require.ErrorAs(t, err, &ee, "子进程应当以非零码退出；输出：\n%s", out)
+
+	// ‼️ 这里**刻意不**断言退出码等于 1：那一条恒绿。正确实现走 os.Exit(1)，而变异实现
+	// （没拦住 ⇒ 子进程那句 t.Fatalf 生效）走的是 go test 的失败退出——**同样是 1**。
+	// 两条路退出码相同 ⇒ 对目标变异零判别力。本格的判别力全在下面两条断言上。
+	require.NotContains(t, string(out), "--- FAIL:",
+		"子进程是 FAIL 掉了（测试没通过），不是被 usage 分支拦下的；输出：\n%s", out)
+
+	// ‼️ 判据取 `Usage:` 而不是 `Usage`：子进程一旦失败，它的输出里**必然**含测试名
+	// （`--- FAIL: <本测试函数名>`），而 go test 的失败消息又总是回显发起断言的那一行。
+	// 于是只要本测试的函数名里含 `Usage` 这个子串，`out` 里就**永远**能找到它 —— 把修复
+	// 变异回去，子进程清清楚楚地 FAIL 了，主进程这一格却照样绿。判据被自己的名字满足，
+	// 是「红不了」的最隐蔽形态。（本用例的函数名结尾是 `…PrintsHelp`，正是不含的那种。）
+	require.Contains(t, string(out), "Usage:",
+		"退出前必须打印用法，否则用户不知道端点该从哪来；输出：\n%s", out)
 }
 
 // TestProgramHighDeviceIDPassesParser 钉住「deviceID ≥ 0x02000000 的帧能穿过 gomavlib

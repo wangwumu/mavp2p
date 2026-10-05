@@ -1,0 +1,50 @@
+# mavp2p 配置文件。
+#
+# 按序加载（后者覆盖前者）：
+#   1. ./mavp2p.yaml                  —— 当前工作目录（云端 systemd 的 WorkingDirectory=/opt/uavm）
+#   2. ~/.config/mavp2p/mavp2p.yaml   —— 用户级
+# 文件**不存在则静默跳过**（kong 的 os.IsNotExist 分支）⇒ 某台机器不放也能启动，走代码里的 default。
+#
+# ‼️ 这里只提供**默认值**：命令行显式给出的参数优先级更高
+#    （kong context.go 的 Resolve()：已在命令行出现的 flag 直接 continue）。
+#
+# ‼️ key 的写法只有两种（与 kong 内置的 kong.JSON 一致）：
+#      连字符换下划线   map_ttl        ← 推荐，与 --help 的参数名一一对应
+#      camelCase        mapTtl
+#    连字符原样的 `map-ttl` **不认**。写错的 key 不会静默生效：main.go 的
+#    yamlResolver.Validate 会把它列出来并拒绝启动。
+#    ⚠️ 别照直觉缩写：单 QGC 关联上限是 `max_qgc_linked_px_4`
+#       （`--help` 里就是 --max-qgc-linked-px-4，末尾的 4 是独立一段）。
+#
+# 本文件只放**跨部署相同的语义参数**；endpoints、--fifo-path 等因机器而异的项
+# 留在各自的启动文件（systemd unit / 脚本）里。
+
+# 映射/在线/配对三张状态表的 TTL（协议附录 A.1 MAP_TTL，规范给的是**建议值** 60s）。
+#
+# ‼️ 本部署取 30s，是对该建议值的**有意偏离**（2026-10-05 裁定）：让 QGC「签出」后配对能
+#    真正过期 —— 签出 ⇒ 该 QGC 下一轮 80005 不再声明该 deviceID，而配对的两条保活源
+#    （80005 周期登记、1Hz 加密上行心跳）也都不再刷新它，于是 30s 后 prune() 删掉该配对，
+#    mavp2p 停止向它转发。按规范建议的 60s，这个窗口要拖满整整一分钟。
+#
+# ‼️ 该值生效的前提：manager.go 的 processEncrypted **不再**用 PX4 下行刷配对的
+#    lastSeen。只改这里、不改那处，TTL 无论 60s 还是 30s 都结构性失效。
+#
+# 余量核算（余量 = 30s ÷ 该表**最慢**的保活周期，周期越大余量越小）：
+#   px4Map     —— 两条保活源，取最慢的那条：PX4 明文待命心跳（规范 §2.5 逐字「默认
+#                 20Hz」⇒ 50ms）与加密下行（规范 §2.5 逐字「下行（PX4 偶数，10Hz）」
+#                 ⇒ 100ms；manager.go 在该分支刷 lastSeen）⇒ 周期 100ms，余量 300×
+#   pairs      —— 任务进行中由 1Hz 加密上行心跳保活（规范逐字：「心跳 1Hz 是配对的
+#                 **主要**保活源」）⇒ 余量 30×
+#   qgcOnline  —— 80005 登记与活跃加密上行**都**刷它（manager.go 两处），最慢的是前者，
+#                 周期见下面这条 ⚠️
+# ⚠️ 80005 是**分片轮转**协议：单条 payload 最多带 max_qgc_linked_px_4 个 deviceID
+#    （manager.go 对 num 有 cap，默认 16），关联更多的 QGC 要分批发。故一轮 =
+#    ceil(n/16) × 10s，其中 n = **该 QGC 关联的整个 deviceID 集合大小**（不是全网飞机
+#    总数，也不是单条 payload 里声明的个数——后者上限就是那个 cap）。qgcOnline 以及
+#    「加密上行心跳缺席时」仅靠登记保活的 pairs，其保活周期就等于这一轮：
+#      n ≤ 16  ⇒ 一轮 10s  ⇒ 余量 3×     宽裕
+#      n 17–32 ⇒ 一轮 20s  ⇒ 余量 1.5×   只剩一拍容错，丢一拍就贴边
+#      n ≥ 33  ⇒ 一轮 ≥30s ⇒ 余量 ≤1×    ✗ 会把在册飞机误删 —— 届时应调大 map_ttl
+#    本机真库 table_uav 现为 **27** 行（2026-10-05 实测）⇒ 若某台 QGC 关联了全部，n=27
+#    落在 1.5× 那一档。
+map_ttl: 30s
