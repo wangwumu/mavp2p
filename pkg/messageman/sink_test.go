@@ -47,11 +47,11 @@ func (s *fakeSink) got() []uint32 {
 // 于是红的是「80005 不得进下游」那格，而不是格 2/4/5。require 是 fail-fast，红了就停，
 // 后面几格根本不执行 ⇒ 描述变异后果要按「哪条断言先失败」，不能按「哪几格会红」。
 func TestSinkDownlinkOnly(t *testing.T) {
-	node, m, stop := newServer(t, "3370")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3370")
-	px4 := connectPeer(t, node, "3370")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	sink := &fakeSink{}
 	m.Sink = sink
@@ -98,15 +98,18 @@ func TestSinkDownlinkOnly(t *testing.T) {
 }
 
 // TestSinkSkipsDroppedFrames 守下游出口的**否定面**：被丢弃的帧不得进下游。
-// 落点若放在防重放判定之前、或放在 px4Map 命中判定之前，断言必红——红在最先受影响的
-// 那一条（80005/待命心跳提前进 sink ⇒ 下面那个 `before == 2` 的前置先失败），
-// 此时三格根本不执行，所以「三格必红」是错的读法。
+// 落点若放在防重放判定之前，断言必红——红在最先受影响的那一条（80005/待命心跳提前
+// 进 sink ⇒ 下面那个 `before == 2` 的前置先失败），此时后续格根本不执行，
+// 所以「每格必红」是错的读法。
+//
+// 注：px4Map 未命中不再是丢弃理由（§3.2.4.1「查不到缓存就新建」，2026-10-25）——
+// 那种帧会被重建表项后正常走到下游，不再属于本用例的否定面。
 func TestSinkSkipsDroppedFrames(t *testing.T) {
-	node, m, stop := newServer(t, "3371")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3371")
-	px4 := connectPeer(t, node, "3371")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	sink := &fakeSink{}
 	m.Sink = sink
@@ -127,14 +130,17 @@ func TestSinkSkipsDroppedFrames(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(10)))
 	require.Equal(t, before, len(sink.got()), "格 1：被防重放丢弃的帧不得进下游")
 
-	// 格 2：未登记 PX4 的下行帧 —— px4Map 查不到，丢弃
-	oInc, oCom, oSys, oComp := didBytes(px4DeviceID + 1)
-	feed(m, px4.ch, makeFrame(oInc, oCom, oSys, oComp, 33, encryptedPayload(4)))
-	require.Equal(t, before, len(sink.got()), "格 2：未知 deviceID 的下行帧不得进下游")
-
-	// 格 3：未登记来源的 QGC 上行（奇数 counter，非 QGC 来源表）—— 忽略
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(7)))
-	require.Equal(t, before, len(sink.got()), "格 3：未登记来源的上行帧不得进下游")
+	// 格 2：未登记地面站通道（未发 80005）的加密上行 —— 忽略
+	// ‼️ 来源必须是 **GCS 端点**的通道：载具端点进来的帧按定义是下行，走不到登记闸，
+	// 本格会退化成「下行 counter 17 > 已写水位 10 ⇒ 防重放放行」——仍然绿，但测的是别的。
+	// counter 取 17（> 已写下行水位 10）：若这一帧走错方向进了下行分支，防重放不会替
+	// 我们兜底，判据才真正落在「登记闸」上。
+	rogue := connectQGC(t, node, gcsPort)
+	feed(m, rogue.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(17)))
+	require.Equal(t, before, len(sink.got()), "格 2：未登记来源的上行帧不得进下游")
+	// 空扇出判据只能证「没进下游」，证不了「没被转发」。补一条对 PX4 的阴性断言：
+	// 未登记通道的上行若被放行，它会被投给目标 PX4。
+	expectNoFrame(t, px4, 300*time.Millisecond)
 }
 
 // TestSinkNilIsNoOp 守 **Sink 未接线**（nil）这一形态——即**默认部署**：不带
@@ -147,11 +153,11 @@ func TestSinkSkipsDroppedFrames(t *testing.T) {
 // 必须送达配对的 QGC。两条路径分别覆盖 manager.go 里的两处守卫（待命心跳一处、
 // 加密下行一处），只喂其中一条会漏掉另一处。
 func TestSinkNilIsNoOp(t *testing.T) {
-	node, m, stop := newServer(t, "3372")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3372")
-	px4 := connectPeer(t, node, "3372")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	// 刻意不设 m.Sink：保持零值 nil。
 

@@ -63,6 +63,17 @@ func newTestPeer(t *testing.T, addr string, sysid, compid byte) *gomavlib.Node {
 	return c
 }
 
+// freePort 探一个当前空闲的 TCP 端口（探完即关；本文件用例全部串行，竞争窗口可接受）。
+func freePort(t *testing.T) int {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+	return port
+}
+
 // testFrame 构造 V2 帧，帧头四字节直接组成 deviceID（§1.2 编码公式）。
 // Checksum 留 0：mavp2p 与测试对端都用**空 dialect**，gomavlib 的 frame reader 在
 // `GetMessage(id) == nil` 时跳过 CRC 校验（pkg/frame/reader.go）。
@@ -90,13 +101,21 @@ func tlogMsgID(t *testing.T, data []byte) uint32 {
 // 协议路由细节由 pkg/messageman 单测覆盖；server 端 node.Events() 由 run() 独占消费，
 // 测试只从 client 端断言。
 func TestProgramEndToEnd(t *testing.T) {
-	p, err := newProgram([]string{"tcps:0.0.0.0:6666"})
+	// 位置参数 = 载具端点；地面站走独立端口。两个地面站对端都连 GCS 口，
+	// 否则 80005 会在入口按角色被拒，本用例就测不到「消费而不转发」这件事。
+	// 端口现探（固定 6666/6766 会在并行跑测试时与别的实例互抢）。
+	port := freePort(t)
+	gcsPort := freePort(t)
+	p, err := newProgram([]string{
+		"tcps:0.0.0.0:" + itoa(port),
+		"--gcs-endpoint", "tcps:0.0.0.0:" + itoa(gcsPort),
+	})
 	require.NoError(t, err)
 	defer p.close()
 
-	qgc := newTestPeer(t, "127.0.0.1:6666", 0x27, 0x10) // deviceID 10000（GCS 段）
+	qgc := newTestPeer(t, "127.0.0.1:"+itoa(gcsPort), 0x27, 0x10) // deviceID 10000（GCS 段）
 	defer qgc.Close()
-	other := newTestPeer(t, "127.0.0.1:6666", 2, 3)
+	other := newTestPeer(t, "127.0.0.1:"+itoa(gcsPort), 2, 3)
 	defer other.Close()
 
 	// client 侧消费连接事件（server 侧连接由 newProgram.run() 处理）
@@ -143,14 +162,13 @@ func TestProgramFifoDownstreamWiring(t *testing.T) {
 	cfgPath := filepath.Join(tmpFolder, "filter.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte("- 0\n- 33\n"), 0o644))
 
-	// 探一个空闲 TCP 端口，避免与并行/残留实例抢端口
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := ln.Addr().(*net.TCPAddr).Port
-	require.NoError(t, ln.Close())
+	// 探两个空闲 TCP 端口（载具口 + GCS 口），避免与并行/残留实例抢端口
+	port := freePort(t)
+	gcsPort := freePort(t)
 
 	p, err := newProgram([]string{
 		"tcps:0.0.0.0:" + itoa(port),
+		"--gcs-endpoint", "tcps:0.0.0.0:" + itoa(gcsPort),
 		"--hb-disable", // 免得 mavp2p 自己的心跳混进对端的接收流
 		"--fifo-enable",
 		"--fifo-path", filepath.Join(tmpFolder, "test.fifo"),
@@ -167,9 +185,10 @@ func TestProgramFifoDownstreamWiring(t *testing.T) {
 	require.Same(t, p.fifoFilter, sink, "Sink 必须是同一个 fifoFilter 实例")
 
 	addr := "127.0.0.1:" + itoa(port)
-	qgc := newTestPeer(t, addr, 0x27, 0x10) // deviceID 10000（GCS 段）
+	gcsAddr := "127.0.0.1:" + itoa(gcsPort)
+	qgc := newTestPeer(t, gcsAddr, 0x27, 0x10) // deviceID 10000（GCS 段），走 GCS 口
 	defer qgc.Close()
-	px4 := newTestPeer(t, addr, 0x01, 0x01) // 用 testFrame 自行指定帧头 deviceID
+	px4 := newTestPeer(t, addr, 0x01, 0x01) // 载具口；帧头 deviceID 由 testFrame 指定
 	defer px4.Close()
 
 	<-qgc.Events()
@@ -278,6 +297,7 @@ func TestProgramMgmtEndpointRequiresFifoEnable(t *testing.T) {
 	// 所以这里不会占用端口、失败时也没有资源要清理。
 	_, err := newProgram([]string{
 		"tcps:0.0.0.0:6667",
+		"--gcs-endpoint", "tcps:0.0.0.0:6767",
 		"--fifo-mgmt-endpoint", "127.0.0.1:12345",
 	})
 	require.Error(t, err, "--fifo-mgmt-endpoint 单独给出必须报错，不得静默降级成 no-op")
@@ -321,7 +341,10 @@ func TestProgramConfigEndpointsMalformedStillReported(t *testing.T) {
 
 	// 命令行**同时**给了端点。若校验被关进 `if len(cli.Endpoints) == 0`，本格的 err
 	// 会是 nil，且进程照常监听 7777（配置文件里那个坏掉的 endpoints 无人过问）。
-	_, err := newProgram([]string{"tcps:0.0.0.0:7777"})
+	_, err := newProgram([]string{
+		"tcps:0.0.0.0:7777",
+		"--gcs-endpoint", "tcps:0.0.0.0:7877",
+	})
 	require.Error(t, err, "配置文件里 endpoints 形态写错必须报错，不因命令行给了端点而豁免")
 	require.Contains(t, err.Error(), "必须是列表",
 		"错误信息要指名形态错在哪（漏了 `-`），否则用户只知道『配置坏了』")
@@ -337,12 +360,13 @@ func TestProgramConfigEndpointsMalformedStillReported(t *testing.T) {
 // 最后一格是阴性对照：形态正确的配置**必须能起来**。缺了它，本用例可以靠「见配置就
 // 报错」蒙混过关 —— 把 Validate 改成无条件 return error，前四格照样全绿。
 func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
-	// 先占一个真实空闲端口：阴性对照那一格会真的把程序起起来。
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := ln.Addr().(*net.TCPAddr).Port
-	require.NoError(t, ln.Close())
-	args := []string{"tcps:127.0.0.1:" + itoa(port)}
+	// 先占两个真实空闲端口（载具口 + GCS 口）：阴性对照那一格会真的把程序起起来。
+	port := freePort(t)
+	gcsPort := freePort(t)
+	args := []string{
+		"tcps:127.0.0.1:" + itoa(port),
+		"--gcs-endpoint", "tcps:127.0.0.1:" + itoa(gcsPort),
+	}
 
 	for _, tc := range []struct {
 		name    string
@@ -372,10 +396,22 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 			wantSub: "必须写成带单位的字符串",
 		},
 		{
+			name:    "UDP 发包间隔同样是 duration，裸数字同样要拒",
+			yaml:    "udp_send_delay: 1\n",
+			wantSub: "必须写成带单位的字符串",
+		},
+		{
+			// 负值会被 gomavlib 的 `WriteDelay <= 0` 当成「关闭」：不拒绝的话，
+			// `-1s` 会静默关闭节流，启动日志之外没有任何提示。
+			name:    "负的 UDP 发包间隔必须拒绝，而不是静默关闭",
+			yaml:    "udp_send_delay: -1s\n",
+			wantSub: "不能为负",
+		},
+		{
 			// 这一格同时是**接线**断言（见下方 Assert）：值取非默认，才能区分「真的接上了」
 			// 与「漏了注入、静默用默认值」。默认值是 10m，所以这里写 30m。
 			name: "阴性对照：两种正确写法都必须能起来，且值真的接到 Manager 上",
-			yaml: "map_ttl: 30s\nmapTtl: 30s\nstate_idle_timeout: 30m\n",
+			yaml: "map_ttl: 30s\nmapTtl: 30s\nstate_idle_timeout: 30m\nudp_send_delay: 2µs\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -399,12 +435,42 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 					"配置文件里的 state_idle_timeout 没接到 messageman.Manager ⇒ 参数形同虚设")
 				require.Equal(t, 30*time.Second, p.messageMan.MapTTL,
 					"配置文件里的 map_ttl 没接到 messageman.Manager")
+				require.Equal(t, 2*time.Microsecond, p.node.WriteDelay,
+					"配置文件里的 udp_send_delay 没接到 gomavlib.Node")
 				return
 			}
 			require.Error(t, err, "配置写错必须在启动前拒绝，而不是静默退回默认值：%s", tc.yaml)
 			require.Contains(t, err.Error(), tc.wantSub)
 		})
 	}
+}
+
+// TestProgramConfigCamelCaseOnly 钉住 camelCase 写法的**独立**可用性。
+//
+// 上一用例的阳性格把 snake_case 与 camelCase 写了同一个值：即使 Resolve 里的
+// camelCase 分支被整段删掉，Validate 仍认这个 key（configKeys 两种都收），值又来自
+// snake_case，断言照样绿 —— 于是「只写 camelCase 的配置被静默忽略」没有任何用例能发现。
+// 本格只写 camelCase，且取非默认值。
+func TestProgramConfigCamelCaseOnly(t *testing.T) {
+	port := freePort(t)
+	gcsPort := freePort(t)
+
+	cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+	require.NoError(t, os.WriteFile(cfg,
+		[]byte("mapTtl: 45s\nudpSendDelay: 3µs\n"), 0o644))
+	swapConfigPaths(t, cfg)
+
+	p, err := newProgram([]string{
+		"tcps:127.0.0.1:" + itoa(port),
+		"--gcs-endpoint", "tcps:127.0.0.1:" + itoa(gcsPort),
+	})
+	require.NoError(t, err, "只写 camelCase 的合法配置必须能起来")
+	defer p.close()
+
+	require.Equal(t, 45*time.Second, p.messageMan.MapTTL,
+		"只写 mapTtl 时值没有生效 ⇒ camelCase 解析被静默忽略")
+	require.Equal(t, 3*time.Microsecond, p.node.WriteDelay,
+		"只写 udpSendDelay 时值没有生效 ⇒ camelCase 解析被静默忽略")
 }
 
 // TestProgramConfigEndpointsAdopted 是上一格的阴性对照：命令行**没给**位置参数时，
@@ -420,14 +486,13 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 // 而测试进程的 os.Args 恒非空 ⇒ 两种写法**都不**进 exit 分支，本格在两边都绿。
 // 能区分它的是 TestProgramNoInputsPrintsHelp（走子进程）。
 func TestProgramConfigEndpointsAdopted(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := ln.Addr().(*net.TCPAddr).Port
-	require.NoError(t, ln.Close())
+	port := freePort(t)
+	gcsPort := freePort(t)
 
 	cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
 	require.NoError(t, os.WriteFile(cfg,
-		[]byte("endpoints:\n  - tcps:0.0.0.0:"+itoa(port)+"\n"), 0o644))
+		[]byte("endpoints:\n  - tcps:0.0.0.0:"+itoa(port)+"\n"+
+			"gcs_endpoint: tcps:0.0.0.0:"+itoa(gcsPort)+"\n"), 0o644))
 	swapConfigPaths(t, cfg)
 
 	// args 为空：端点只能来自配置文件。判据若误读 os.Args，这里会 PrintUsage+exit(1)，
@@ -436,10 +501,23 @@ func TestProgramConfigEndpointsAdopted(t *testing.T) {
 	require.NoError(t, err, "端点只写在配置文件里时，args 为空也必须能起来")
 	defer p.close()
 
-	// 值保真：真连上去，确认监听的就是配置文件里写的那个端口（不是别的来源兜的）
-	peer := newTestPeer(t, "127.0.0.1:"+itoa(port), 2, 3)
-	defer peer.Close()
-	<-peer.Events()
+	// 启动默认值也钉在真实装配路径上：配置里没写这两项时必须是 10m / 1µs。
+	// 只改 kong tag 而忘了文档/运维口径，或把默认改成 0（pacing 静默消失）都要红。
+	require.Equal(t, 10*time.Minute, p.messageMan.StateIdleTimeout,
+		"state_idle_timeout 的启动默认值不是 10m")
+	require.Equal(t, time.Microsecond, p.node.WriteDelay,
+		"udp_send_delay 的启动默认值不是 1µs（0 会让节流静默消失）")
+
+	// 值保真：两个端点都真连一次，确认监听的就是配置文件里写的端口（不是别的来源兜的）。
+	// GCS 口这一条同时钉住 YAML 键 `gcs_endpoint` 与 CLI flag 的映射：键名写错会被
+	// yamlResolver 报成「无法识别的配置项」，本格前面就已红。
+	vehPeer := newTestPeer(t, "127.0.0.1:"+itoa(port), 2, 3)
+	defer vehPeer.Close()
+	<-vehPeer.Events()
+
+	gcsPeer := newTestPeer(t, "127.0.0.1:"+itoa(gcsPort), 2, 3)
+	defer gcsPeer.Close()
+	<-gcsPeer.Events()
 }
 
 // noInputsEnv 让同一个测试函数在子进程里以「用户啥也没给」的身份再跑一次。
@@ -517,23 +595,23 @@ func TestProgramHighDeviceIDPassesParser(t *testing.T) {
 		{"高号段 0x02000000（incompat=0x02，须 fork 才放行）", 0x02000000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// 探一个空闲 TCP 端口，避免与并行/残留实例抢端口
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			require.NoError(t, err)
-			port := ln.Addr().(*net.TCPAddr).Port
-			require.NoError(t, ln.Close())
+			// 探两个空闲 TCP 端口（载具口 + GCS 口），避免与并行/残留实例抢端口
+			port := freePort(t)
+			gcsPort := freePort(t)
 
 			p, err := newProgram([]string{
 				"tcps:0.0.0.0:" + itoa(port),
+				"--gcs-endpoint", "tcps:0.0.0.0:" + itoa(gcsPort),
 				"--hb-disable", // 免得 mavp2p 自己的心跳混进对端的接收流
 			})
 			require.NoError(t, err)
 			defer p.close()
 
 			addr := "127.0.0.1:" + itoa(port)
-			qgc := newTestPeer(t, addr, 0x27, 0x10) // GCS 段（登记帧头用）
+			gcsAddr := "127.0.0.1:" + itoa(gcsPort)
+			qgc := newTestPeer(t, gcsAddr, 0x27, 0x10) // GCS 段（登记帧头用），走 GCS 口
 			defer qgc.Close()
-			px4 := newTestPeer(t, addr, 0x01, 0x01) // 帧头 deviceID 由 testFrame 指定
+			px4 := newTestPeer(t, addr, 0x01, 0x01) // 载具口；帧头 deviceID 由 testFrame 指定
 			defer px4.Close()
 
 			<-qgc.Events()
@@ -614,15 +692,13 @@ func frameCounter(t *testing.T, ef *gomavlib.EventFrame) uint64 {
 	return binary.BigEndian.Uint64(raw.Payload[:8])
 }
 
-// uplinkFrame / downlinkFrame 构造加密帧 payload，并**校验 counter 的奇偶与方向一致**。
+// uplinkFrame / downlinkFrame 按**入口端点**构造帧，不再断言 counter 奇偶。
 //
-// 方向由 counter 奇偶决定（messageman `odd = counter&1 == 1`）：奇数=上行(QGC)、
-// 偶数=下行(PX4)。写反不会报错——帧会走另一条分支（PX4 发的奇数帧被当上行来源、
-// 又不在 QGC 在线表里 ⇒ 静默 `ignoring`），于是「没进下游」看着是绿的，实际是空判据。
-// 本文件首次写就栽在这里（格 5/6 用了奇数 counter，waitFrame 超时才暴露）。
+// ⚠️ 奇偶不是路由依据，也不是合法性判据：mavp2p 的方向由入口端点决定（GCS 口=上行、
+// 载具口=下行），与 counter 无关。发送端当前按奇偶分道只是防重约定（可演进），夹具
+// 若强断言奇偶，会把这条可演进策略钉死成测试前提。
 func uplinkFrame(t *testing.T, counter uint64, heartbeat bool) []byte {
 	t.Helper()
-	require.Equal(t, uint64(1), counter%2, "上行帧 counter 必须是奇数（方向由奇偶判定）")
 	if heartbeat {
 		return encryptedHeartbeat(counter)
 	}
@@ -631,7 +707,6 @@ func uplinkFrame(t *testing.T, counter uint64, heartbeat bool) []byte {
 
 func downlinkFrame(t *testing.T, counter uint64, heartbeat bool) []byte {
 	t.Helper()
-	require.Equal(t, uint64(0), counter%2, "下行帧 counter 必须是偶数（方向由奇偶判定）")
 	if heartbeat {
 		return encryptedHeartbeat(counter)
 	}
@@ -666,4 +741,83 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// TestProgramRequiresGCSEndpoint 钉住「方向由入口端点决定」的配置前提：只给载具端点
+// （旧的单端口用法）必须在建资源前当场拒绝，不得退化成「靠 counter 奇偶猜方向」。
+func TestProgramRequiresGCSEndpoint(t *testing.T) {
+	port := freePort(t)
+
+	_, err := newProgram([]string{"tcps:127.0.0.1:" + itoa(port)})
+	require.Error(t, err, "缺 --gcs-endpoint 却启动 ⇒ 方向判定只能靠猜")
+	require.Contains(t, err.Error(), "gcs-endpoint",
+		"错误信息必须点名缺的那个参数，否则用户不知道该加什么")
+
+	// 阴性对照：补上 GCS 端点必须能起来，否则上面那格可以靠「无条件报错」假绿。
+	gcsPort := freePort(t)
+	p, err := newProgram([]string{
+		"tcps:127.0.0.1:" + itoa(port),
+		"--gcs-endpoint", "tcps:127.0.0.1:" + itoa(gcsPort),
+	})
+	require.NoError(t, err, "合法的双端点配置被拒绝 ⇒ 正常启动路径起不来")
+	defer p.close()
+}
+
+// TestProgramRejectsIncompleteOrBadEndpointRoles 覆盖端点角色的其余配置负例：
+// 缺载具端点、gcs 端点形态非法、配置文件的 gcs_endpoint 与载具端点同串。
+//
+// 三格都必须在**建资源之前**拒绝：前两格若放行，进程会起在只有一半判据的状态下
+// （每帧都只能猜）；第三格放行则同一监听口上 roleOf 永远只返回一个角色。
+func TestProgramRejectsIncompleteOrBadEndpointRoles(t *testing.T) {
+	t.Run("只给 --gcs-endpoint，没有载具端点", func(t *testing.T) {
+		_, err := newProgram([]string{"--gcs-endpoint", "tcps:127.0.0.1:" + itoa(freePort(t))})
+		require.Error(t, err, "只有 GCS 端点却启动 ⇒ 方向判据缺了载具这一半")
+		require.Contains(t, err.Error(), "载具端点",
+			"错误信息必须点名缺的是载具端点，而不是笼统的「至少需要一个端点」")
+	})
+
+	t.Run("gcs 端点形态非法", func(t *testing.T) {
+		_, err := newProgram([]string{
+			"tcps:127.0.0.1:" + itoa(freePort(t)),
+			"--gcs-endpoint", "bogus",
+		})
+		require.Error(t, err, "非法形态的 --gcs-endpoint 被接受 ⇒ 运行期没有任何端点监听，方向判据形同虚设")
+		require.Contains(t, err.Error(), "--gcs-endpoint",
+			"错误信息必须指名是哪个参数写错了")
+	})
+
+	t.Run("配置文件里 gcs_endpoint 与载具端点同串", func(t *testing.T) {
+		spec := "tcps:127.0.0.1:" + itoa(freePort(t))
+		cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+		require.NoError(t, os.WriteFile(cfg,
+			[]byte("endpoints:\n  - "+spec+"\ngcs_endpoint: "+spec+"\n"), 0o644))
+		swapConfigPaths(t, cfg)
+
+		_, err := newProgram(nil)
+		require.Error(t, err, "配置文件的 gcs_endpoint 与载具端点同串 ⇒ 同一端口无法区分来源")
+		require.Contains(t, err.Error(), "不同端点")
+	})
+
+	t.Run("配置文件只给载具端点，缺 gcs_endpoint", func(t *testing.T) {
+		spec := "tcps:127.0.0.1:" + itoa(freePort(t))
+		cfg := filepath.Join(t.TempDir(), "mavp2p.yaml")
+		require.NoError(t, os.WriteFile(cfg, []byte("endpoints:\n  - "+spec+"\n"), 0o644))
+		swapConfigPaths(t, cfg)
+
+		_, err := newProgram(nil)
+		require.Error(t, err, "配置文件没写 gcs_endpoint 却启动 ⇒ 退回单端口、方向只能猜")
+		require.Contains(t, err.Error(), "gcs_endpoint",
+			"错误信息必须让只写 YAML 的部署方知道该加哪个键")
+	})
+}
+
+// TestProgramRejectsSharedGCSEndpoint：两个角色共用一个端点 ⇒ 同一端口上无法区分
+// 来源是地面站还是载具，roleOf 会把它判成同一个角色。必须在启动前拒绝。
+func TestProgramRejectsSharedGCSEndpoint(t *testing.T) {
+	spec := "tcps:127.0.0.1:" + itoa(freePort(t))
+
+	_, err := newProgram([]string{spec, "--gcs-endpoint", spec})
+	require.Error(t, err, "同一端点同时作为 GCS 与载具入口 ⇒ 方向无从区分")
+	require.Contains(t, err.Error(), "不同端点",
+		"错误信息要说明两者必须分开，否则用户只会把它当成端口冲突")
 }

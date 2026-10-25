@@ -3,6 +3,8 @@ package messageman_test
 import (
 	"context"
 	"encoding/binary"
+	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -30,13 +32,38 @@ type peer struct {
 }
 
 // newServer 启动 server node（mavp2p 角色，空 dialect）+ 会话路由器，返回清理函数。
-func newServer(t *testing.T, port string) (*gomavlib.Node, *messageman.Manager, func()) {
+//
+// 双端点：vehiclePort 收载具（下行入口），gcsPort 收地面站（上行入口）。
+// 方向由**通道落在哪个端点**决定，两条流结构上不共享端口；测试必须走真实端点，
+// 不能只造一个 channel 传角色参数，否则「端点→角色」这段映射根本没被覆盖。
+//
+// 端口由 freePort 现探，不再用「每个用例一个固定号段」：并行跑同一个包的多次
+// `go test`（审查代理各自跑一遍就是这么撞的）会抢同一批端口，失败长成
+// 「bind: address already in use」而不是断言错，看上去像代码缺陷。
+func newServer(t *testing.T) (*gomavlib.Node, *messageman.Manager, string, string, func()) {
 	t.Helper()
 
+	node, m, vehiclePorts, gcsPort, stop := newServerN(t, 1)
+	return node, m, vehiclePorts[0], gcsPort, stop
+}
+
+// newServerN 是 newServer 的通用形态：numVehicles 个载具端点 + 一个 GCS 端点。
+// 多载具端点用来钉「每个载具端点都映射成同一个 roleVehicle，deviceID 决定投给谁」。
+func newServerN(t *testing.T, numVehicles int) (*gomavlib.Node, *messageman.Manager, []string, string, func()) {
+	t.Helper()
+
+	require.GreaterOrEqual(t, numVehicles, 1)
+
+	vehiclePorts := make([]string, numVehicles)
+	vehicleEPs := make([]gomavlib.Endpoint, numVehicles)
+	for i := range vehiclePorts {
+		vehiclePorts[i] = freePort(t)
+		vehicleEPs[i] = &gomavlib.EndpointTCPServer{Address: "127.0.0.1:" + vehiclePorts[i]}
+	}
+	gcsPort := freePort(t)
+	gcsEP := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:" + gcsPort}
 	node := &gomavlib.Node{
-		Endpoints: []gomavlib.Endpoint{
-			&gomavlib.EndpointTCPServer{Address: "127.0.0.1:" + port},
-		},
+		Endpoints:      append(append([]gomavlib.Endpoint{}, vehicleEPs...), gcsEP),
 		OutVersion:     gomavlib.V2,
 		OutSystemID:    125,
 		OutComponentID: 191,
@@ -54,17 +81,31 @@ func newServer(t *testing.T, port string) (*gomavlib.Node, *messageman.Manager, 
 		Wg:  &wg,
 		Config: messageman.Config{
 			GCSDeviceIDMax: gcsDeviceIDMax,
+			// 端点对象与 Node.Endpoints 里的是**同一批指针**（roleOf 用指针比较认来源）。
+			GCSEndpoint:      gcsEP,
+			VehicleEndpoints: vehicleEPs,
 		},
 		Node: node,
 	}
 	err = m.Initialize()
 	require.NoError(t, err)
 
-	return node, m, func() {
+	return node, m, vehiclePorts, gcsPort, func() {
 		cancel()
 		wg.Wait()
 		node.Close()
 	}
+}
+
+// freePort 探一个当前空闲的 TCP 端口（探完即关）。同包用例串行，竞争窗口可接受；
+// 即便撞上，失败也会以 bind 错误明确指向环境，而不是变成一条看不懂的断言失败。
+func freePort(t *testing.T) string {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close() //nolint:errcheck
+	return strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
 }
 
 // connectPeer 建立一个 client 对端并返回（含 server 端 channel）。
@@ -90,7 +131,26 @@ func connectPeer(t *testing.T, node *gomavlib.Node, port string) *peer {
 	// client 侧消费自己的连接事件
 	<-c.Events()
 
+	// 防串线：断言服务端为该对端分配的通道确实落在刚拨的端口上。
+	// 少了这一条，把 QGC 拨到载具口、把 PX4 拨到 GCS 口也会「跑通」——
+	// 那时测的就不是方向判定，而是恰好反着写的一对常量。
+	serverEP, ok := co.Channel.Endpoint().(*gomavlib.EndpointTCPServer)
+	require.True(t, ok, "unexpected server endpoint type %T", co.Channel.Endpoint())
+	require.Equal(t, "127.0.0.1:"+port, serverEP.Address)
+
 	return &peer{node: c, ch: co.Channel}
+}
+
+// connectQGC 连接地面站入口（上行）。
+func connectQGC(t *testing.T, node *gomavlib.Node, gcsPort string) *peer {
+	t.Helper()
+	return connectPeer(t, node, gcsPort)
+}
+
+// connectPX4 连接载具入口（下行）。
+func connectPX4(t *testing.T, node *gomavlib.Node, vehiclePort string) *peer {
+	t.Helper()
+	return connectPeer(t, node, vehiclePort)
 }
 
 // didBytes 拆分 deviceID 为帧头 4 字节（incompat/compat/sysid/compid，§1.2 编码公式）。
@@ -205,11 +265,11 @@ func encryptedHeartbeatPayload(counter uint64) []byte {
 // TestSessionRouting 覆盖 §3.2 主流程：登记 → 待命心跳扇出 → 加密上行建链 →
 // 加密下行只发配对 QGC → 回待命清配对。
 func TestSessionRouting(t *testing.T) {
-	node, m, stop := newServer(t, "3346")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3346")
-	px4 := connectPeer(t, node, "3346")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID) // PX4 帧头 deviceID 四字节
 	reg := registrationPayload(px4DeviceID)
@@ -236,7 +296,7 @@ func TestSessionRouting(t *testing.T) {
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
 
 	// ---- 5. 第二个 QGC（在线，但不关联该任务 PX4：空关联集合）→ 不参与配对，PX4 下行不发给它 ----
-	other := connectPeer(t, node, "3346")
+	other := connectQGC(t, node, gcsPort)
 	feed(m, other.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload()))
 	down2 := encryptedPayload(4)
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, down2))
@@ -258,11 +318,11 @@ func TestSessionRouting(t *testing.T) {
 
 // TestReplayDropped 覆盖边缘防重放（§3.1）：同方向同 deviceID 的 counter 不递增则丢弃。
 func TestReplayDropped(t *testing.T) {
-	node, m, stop := newServer(t, "3347")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3347")
-	px4 := connectPeer(t, node, "3347")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -287,11 +347,11 @@ func TestReplayDropped(t *testing.T) {
 // PX4 待命心跳 + QGC 80005 被动重建配对，无需主动握手。
 func TestRestartRecovery(t *testing.T) {
 	// 新 server（模拟 mavp2p 重启后，状态全空）
-	node, m, stop := newServer(t, "3348")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3348")
-	px4 := connectPeer(t, node, "3348")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -306,16 +366,51 @@ func TestRestartRecovery(t *testing.T) {
 	expectFrame(t, px4, 1*time.Second)
 }
 
+// TestDownlinkRebuildsPX4EntryAfterRestart 覆盖 §3.2.4.1 的「查不到缓存就新建」：
+// mavp2p 在飞机**已进入加密阶段**时重启（QGC 未退出），PX4 不会再发明文待命心跳，
+// 重建只能靠加密下行的帧头 deviceID（= 发送方自身）。
+// 改前该分支对 px4Map 未命中直接丢弃 ⇒ 飞机落地前整条下行无法自愈。
+func TestDownlinkRebuildsPX4EntryAfterRestart(t *testing.T) {
+	// 新 server（模拟 mavp2p 重启后，状态全空）
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 1. QGC 80005 先到 → 配对已建，但 px4Ch 为空（PX4 映射表尚无该项）。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+
+	// 2. PX4 直接发**加密下行**（不发明文待命心跳 —— 它正在飞）：
+	//    必须按帧头 deviceID 重建 px4Map，并补全配对的 px4Ch 后立即投递。
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(t, ef))
+
+	// 3. 重建的表项可用于上行寻址：QGC 加密上行应定向到该 PX4。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(3)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(76), ef.Frame.GetMessage().GetID())
+
+	// 4. 后续下行持续可达（不是只放行首帧）。
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint64(4), frameCounter(t, ef))
+}
+
 // TestPX4SocketIDDrift 覆盖 §3.2.1 核心规则 / §3.2.2 步骤 8 / §3.2.3 socketID 漂移：
 // PX4 失联恢复（5G 动态地址 NAT 重建）后，来源 socketID 与 PX4 映射表记录不一致，
 // mavp2p 须按帧头 deviceID（= 发送方自身）刷新映射表 + 配对表 PX4 侧 socketID，
 // 仍把加密下行帧定向转发给配对的任务 QGC（不得丢弃）；上行亦须路由到刷新后的 PX4。
 func TestPX4SocketIDDrift(t *testing.T) {
-	node, m, stop := newServer(t, "3349")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3349")
-	px4 := connectPeer(t, node, "3349")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -338,7 +433,7 @@ func TestPX4SocketIDDrift(t *testing.T) {
 	require.Equal(t, uint64(2), frameCounter(t, ef))
 
 	// PX4 重连：新连接（channel B）模拟 NAT 重建后 socketID 漂移。
-	px4b := connectPeer(t, node, "3349")
+	px4b := connectPX4(t, node, vehiclePort)
 	feed(m, px4b.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
 	// §3.2.1 核心规则：按帧头 deviceID 刷新 socketID 后，仍应转发给配对 QGC。
 	ef = expectFrame(t, qgc, 1*time.Second)
@@ -364,21 +459,21 @@ func TestPX4SocketIDDrift(t *testing.T) {
 	// 防退化：用第三个 channel 重放曾只在旧 channel A 出现过的低 counter=2——
 	// device-keyed 下 2<=6 丢弃；若实现退化为 channel-keyed（px4c 水位为空）则会转发，
 	// 该断言即失败。此测试隔离验证 nonce 水位跨 channel 继承。
-	px4c := connectPeer(t, node, "3349")
+	px4c := connectPX4(t, node, vehiclePort)
 	feed(m, px4c.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
 	expectNoFrame(t, qgc, 300*time.Millisecond)
 }
 
 // TestUnregisteredQGCUplinkIgnored 覆盖 §3.2.3 / §3.2.4：未登记 QGC（80005 被 MAP_TTL
-// 剪除、或未先登记就发包）的加密上行帧——帧头 deviceID = 目标 PX4 的 D、来源不在
-// QGC 在线表、counter 为奇数（上行特征）。mavp2p 不得把它误判为 PX4 下行而改写
+// 剪除、或未先登记就发包）的加密上行帧——帧头 deviceID = 目标 PX4 的 D、来源是
+// **GCS 端点**上不在 QGC 在线表里的通道。mavp2p 不得把它误判为 PX4 下行而改写
 // PX4 映射表（那会导致上行命令被重定向、跨 QGC 泄露），须忽略，等该 QGC 补发 80005。
 func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
-	node, m, stop := newServer(t, "3350")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3350")
-	px4 := connectPeer(t, node, "3350")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -392,7 +487,7 @@ func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
 	expectFrame(t, px4, 1*time.Second)
 
 	// 未登记来源（未发 80005）发加密上行（奇数 counter）→ 忽略：不转发、不改写 PX4 映射
-	rogue := connectPeer(t, node, "3350")
+	rogue := connectQGC(t, node, gcsPort)
 	feed(m, rogue.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(101)))
 	expectNoFrame(t, px4, 300*time.Millisecond)
 	expectNoFrame(t, qgc, 300*time.Millisecond)
@@ -418,11 +513,11 @@ func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
 // `delete(m.lastNonce, nkDown)` 的守护者：该行若被移除，格 3 的待命心跳会重新满足前提、
 // 清掉自己刚建的配对，末端下行断言随即超时（已用变异体实测）。
 func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
-	node, m, stop := newServer(t, "3351")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3351")
-	px4 := connectPeer(t, node, "3351")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -465,11 +560,11 @@ func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
 // （日志有 dropped replayed frame，但链路层表现为「建链成功却控制不了飞机」）。
 // 本用例中旧水位 1001、新起点 3，二者不会随机碰撞。
 func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
-	node, m, stop := newServer(t, "3352")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3352")
-	px4 := connectPeer(t, node, "3352")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -508,12 +603,12 @@ func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
 // 单 PX4 的用例分不出「清该架」与「清全表」（结果相同），故必须两台：PX4_A 回待命后，
 // PX4_B 的加密下行仍须送达已配对的 QGC——B 的配对若被连带清掉，下行将无接收者。
 func TestStandbyClearScopedToThatPX4(t *testing.T) {
-	node, m, stop := newServer(t, "3353")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3353")
-	px4a := connectPeer(t, node, "3353")
-	px4b := connectPeer(t, node, "3353")
+	qgc := connectQGC(t, node, gcsPort)
+	px4a := connectPX4(t, node, vehiclePort)
+	px4b := connectPX4(t, node, vehiclePort)
 
 	const px4DeviceIDB = uint32(10000002)
 	aInc, aCom, aSys, aComp := didBytes(px4DeviceID)
@@ -563,11 +658,11 @@ func TestStandbyClearScopedToThatPX4(t *testing.T) {
 // ——该 PX4 加密下行仍须送达配对 QGC；⑤ 回待命复位后加密心跳恢复放行（否则任务结束后
 // 新会话的第一条上行若恰是心跳，该会话永远建不起来）。
 func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
-	node, m, stop := newServer(t, "3354")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3354")
-	px4 := connectPeer(t, node, "3354")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -614,11 +709,11 @@ func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
 // 边缘判重**静默丢弃**（链路层表现为「建链成功却控制不了飞机」）；本实现拦截即返回，
 // 水位停在 1，3 正常放行。拦截点若写在配对刷新之前（水位写入之后），本用例必红。
 func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
-	node, m, stop := newServer(t, "3355")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3355")
-	px4 := connectPeer(t, node, "3355")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -653,11 +748,11 @@ func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
 // 前置中的阴性对照不可省：它以「加密心跳确实被拦」证明置位真的生效——否则末帧放行
 // 也可能只是标记从未置位，用例即使绿也说明不了任何事。
 func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
-	node, m, stop := newServer(t, "3356")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3356")
-	px4 := connectPeer(t, node, "3356")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -689,11 +784,11 @@ func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
 // 若复位被改成与清配对同一个前提，标记在该状态下永久卡住 ⇒ 该 PX4 下一会话的首帧加密
 // 上行心跳被拦、链路再也建不起来（§2.5「该复位无前提条件」）。
 func TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark(t *testing.T) {
-	node, m, stop := newServer(t, "3357")
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
 	defer stop()
 
-	qgc := connectPeer(t, node, "3357")
-	px4 := connectPeer(t, node, "3357")
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
 
 	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
 
@@ -716,4 +811,285 @@ func TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark(t *testing.T) {
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
 	ef := expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint64(7), frameCounter(t, ef))
+}
+
+// ---- 双端点方向判定的判别性用例 ----
+//
+// 下面四条都在钉同一件事：方向由**入口端点**决定，与 counter 奇偶无关。
+//
+// 判别力是**变异实测**的，不是对历史代码的断言：把本次的判据按旧逻辑改回去
+// （方向退回 counter 奇偶兜底、去掉两道入口闸），四条全红（2026-10-25）。
+// 各自暴露的失败形态：
+//   - 载具口奇数 counter：被当「未登记上行」丢掉；
+//   - GCS 口偶数 counter：被当「下行」改写 px4Map（上行命令被重定向）；
+//   - 载具口 80005：照样登记，幽灵 QGC 进入 qgcOnline 收到扇出；
+//   - GCS 口明文待命心跳：照样当 PX4 心跳扇出。
+
+// TestVehiclePortOddCounterIsDownlink：载具入口的帧即使 counter 是奇数（旧判据的
+// 「上行特征」），也必须按下行处理并投给配对 QGC。
+func TestVehiclePortOddCounterIsDownlink(t *testing.T) {
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：登记 + 待命心跳 + 上行建链
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	_ = expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	_ = expectFrame(t, px4, 1*time.Second) // 上行转发
+
+	// 载具端口进来一帧**奇数** counter 的加密帧 ⇒ 仍是下行，投给配对 QGC。
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
+	ef := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint64(3), frameCounter(t, ef),
+		"载具入口的奇数 counter 帧被当成上行丢弃 ⇒ 方向仍在读 counter 奇偶")
+}
+
+// TestUnregisteredGCSEvenCounterStaysUplink：GCS 入口的帧即使 counter 为偶数
+// （旧判据的「下行特征」），也绝不能按下行处理——不得写入/改写 px4Map，不得扇出。
+// 未登记的通道一律丢弃（登记是授权闸）。
+func TestUnregisteredGCSEvenCounterStaysUplink(t *testing.T) {
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
+	rogue := connectQGC(t, node, gcsPort) // 从不发 80005
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：真实 QGC 登记 + PX4 待命 + 建链
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	_ = expectFrame(t, qgc, 1*time.Second)
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	_ = expectFrame(t, px4, 1*time.Second)
+
+	// 未登记通道从 GCS 口发**偶数** counter、帧头 deviceID 命中 PX4：
+	// 必须按「未登记上行」丢弃，而不是按下行改写 px4Map。
+	feed(m, rogue.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(4)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+	expectNoFrame(t, rogue, 300*time.Millisecond)
+
+	// px4Map 未被污染：真实 QGC 的后续上行仍转发给**真实** PX4 通道。
+	// （旧实现下这里会转发到 rogue，因为下行分支把 px4Map[did].channel 改写了。）
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(6), frameCounter(t, ef),
+		"未登记 GCS 通道的偶数 counter 被当成了 PX4 下行 ⇒ 上行路由被改写")
+	expectNoFrame(t, rogue, 300*time.Millisecond)
+
+	// 登记通道的**偶数** counter 也必须按上行转发：上行不再依赖 counter 奇偶。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(8)))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint64(8), frameCounter(t, ef),
+		"已登记 GCS 通道的偶数 counter 没被当成上行 ⇒ 上行仍按奇偶判定")
+}
+
+// TestRegistrationOnVehicleEndpointIgnored：80005 只在地面站入口生效。
+// 从载具入口收到 80005 ⇒ 丢弃、不登记；该通道不得进入 qgcOnline，
+// 因而收不到 PX4 待命心跳扇出。
+func TestRegistrationOnVehicleEndpointIgnored(t *testing.T) {
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	px4 := connectPX4(t, node, vehiclePort)
+	intruder := connectPX4(t, node, vehiclePort) // 从载具端口伪装成 QGC 登记
+	qgc := connectQGC(t, node, gcsPort)          // 正路登记，兼作扇出阳性对照
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 正路 QGC 先登记：没有它，下面的 expectNoFrame 可以靠「qgcOnline 本来就是空」假绿。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, intruder.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+
+	// 阳性对照：扇出本身在工作 —— 正路 QGC 必须收到待命心跳。
+	require.Equal(t, uint32(0), expectFrame(t, qgc, 1*time.Second).Frame.GetMessage().GetID(),
+		"正路登记的地面站没收到待命心跳 ⇒ 下面的阴性断言失去判别力")
+	expectNoFrame(t, intruder, 300*time.Millisecond)
+}
+
+// TestPlaintextHeartbeatOnGCSEndpointIgnored：明文待命心跳只在载具入口生效。
+// 从地面站入口收到 PX4 段明文明文心跳 ⇒ 丢弃：不登记 px4Map、不扇出给在线 QGC。
+func TestPlaintextHeartbeatOnGCSEndpointIgnored(t *testing.T) {
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	qgc := connectQGC(t, node, gcsPort)
+	rogue := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// qgc 先登记，使「扇出给在线 QGC」这一路径真的可达（否则本用例可被
+	// 「qgcOnline 本来就是空」假绿）。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+
+	feed(m, rogue.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+	expectNoFrame(t, rogue, 300*time.Millisecond)
+
+	// 第二个否定面：被丢弃的明文心跳不得顺带在 px4Map 登记该 deviceID。从行为面验：
+	// 已登记 QGC 发往这个「尚未在任何载具端点出现过」的 PX4 的加密上行必须被忽略。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(1)))
+	expectNoFrame(t, px4, 300*time.Millisecond) // 也顺带钉住「已登记但未知 PX4 的上行被忽略」
+
+	// 阳性对照：同一形态的明文心跳从**载具入口**进来时必须扇出给已登记 QGC。
+	// 没有这一格，上面的阴性断言可以靠「扇出路径整体坏了」假绿。
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	require.Equal(t, uint32(0), expectFrame(t, qgc, 1*time.Second).Frame.GetMessage().GetID(),
+		"载具入口的明文待命心跳没有扇出 ⇒ 本用例没有判别力")
+
+	// 再验一次上行通路：此刻 PX4 已由待命心跳登记，同样的上行必须被转发。
+	// 与上面那条阴性断言配对，才证明「没转发」是登记闸造成的、而不是转发坏了。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(2)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(76), ef.Frame.GetMessage().GetID())
+}
+
+// TestStandbyHeartbeatOutsideAircraftSegmentIgnored：明文待命心跳的号段闸必须与 80005
+// 登记、加密下行重建**同一口径**（PX4 段且 bit24=0），不能只比对下界。
+//
+// 改前只判 `did >= gcsDeviceIDMax()`：向载具端点发一帧 9B 明文心跳、id 取 0x7F016379
+// （超过 0x7EFFFFFF 且 bit24 置位）就能在 px4Map 里种出「幻象 PX4」，随后该 did 的加密
+// 下行在缓存命中分支直接通过 —— 2026-10-26 新加的号段闸只覆盖「新建」路径，被这条登记
+// 路径绕过。同时该帧还会扇出给所有在线 QGC，污染面比单纯建表更大。
+//
+// 三组判据缺一不可：非法心跳不扇出 / 非法心跳不建 px4Map（用后续上行是否被转发验） /
+// 合法心跳与合法上行都必须仍工作（否则「不转发」可以靠转发整体坏了假绿）。
+func TestStandbyHeartbeatOutsideAircraftSegmentIgnored(t *testing.T) {
+	// 取「超过 0x7EFFFFFF 上界、bit24=0」的 ID。不用 bit24 置位的值（如 0x7F016379）：
+	// 该位正是 MAVLink 2 的签名位，测试构造的 V2Frame 没有 Signature，一旦被转发会在
+	// 重编码时 nil 解引用（那是测试夹具的坑，不是被测行为）。bit24 子句由
+	// validAircraftDeviceID 的既有用例（0x01000001）覆盖，本用例只需证明待命路径用上了
+	// **完整**的号段闸，而不是只比对下界。
+	const invalidDID = uint32(0x80016379)
+
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	px4 := connectPX4(t, node, vehiclePort)
+	qgc := connectQGC(t, node, gcsPort)
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+	iInc, iCom, iSys, iComp := didBytes(invalidDID)
+
+	// 正路 QGC 先登记，使「扇出给在线 QGC」真的可达（否则下面的不扇出可被空表假绿）。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+
+	// ---- 非法号段的明文待命心跳：不得扇出 ----
+	feed(m, px4.ch, makeFrame(iInc, iCom, iSys, iComp, 0, standbyHeartbeatPayload()))
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+
+	// ---- 也不得建 px4Map：已登记 QGC 发往该 deviceID 的上行必须被忽略 ----
+	feed(m, qgc.ch, makeFrame(iInc, iCom, iSys, iComp, 76, encryptedNonHeartbeatPayload(1)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// ---- 阳性对照 1：合法待命心跳照常扇出 ----
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	require.Equal(t, uint32(0), expectFrame(t, qgc, 1*time.Second).Frame.GetMessage().GetID(),
+		"合法载具入口的明文待命心跳没有扇出 ⇒ 上面的「不扇出」断言没有判别力")
+
+	// ---- 阳性对照 2：合法上行照常转发 ----
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 76, encryptedNonHeartbeatPayload(2)))
+	require.Equal(t, uint32(76), expectFrame(t, px4, 1*time.Second).Frame.GetMessage().GetID(),
+		"合法上行没有转发 ⇒ 上面「非法 ID 上行被忽略」可以靠转发整体坏了假绿")
+
+	// ---- 再验一次：转发已证明可用后，非法 ID 的上行仍必须被忽略 ----
+	feed(m, qgc.ch, makeFrame(iInc, iCom, iSys, iComp, 76, encryptedNonHeartbeatPayload(3)))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+}
+
+// TestRequestDataStreamPlaintextBlockedOnBothEndpoints 钉住 RequestDataStream（msgID 66）
+// 拦截的**范围**：判据只看「明文」，与入口角色无关。
+//
+// 这一条是撤回角色化改动的回归用例：曾把拦截面收窄成「只拦 GCS 入口」，于是载具入口的
+// 明文 66 会被当成普通下行投给 QGC。协议里 66 是请求方发起的控制帧，明文形态一律不是
+// 本链路的合法流量，两个入口都该拦。
+func TestRequestDataStreamPlaintextBlockedOnBothEndpoints(t *testing.T) {
+	node, m, vehiclePort, gcsPort, stop := newServer(t)
+	defer stop()
+
+	qgc := connectQGC(t, node, gcsPort)
+	px4 := connectPX4(t, node, vehiclePort)
+
+	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
+
+	// 前置：登记 + 待命 + 上行建链（让两个方向的转发都真的可达）
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
+	_ = expectFrame(t, qgc, 1*time.Second)
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1)))
+	_ = expectFrame(t, px4, 1*time.Second)
+
+	// 明文 66（5B）从 GCS 入口：拦下，不转发给 PX4
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 66, []byte{0, 0, 0, 1, 0}))
+	expectNoFrame(t, px4, 300*time.Millisecond)
+
+	// 明文 66 从载具入口：同样拦下，不投给配对 QGC
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 66, []byte{0, 0, 0, 1, 0}))
+	expectNoFrame(t, qgc, 300*time.Millisecond)
+
+	// 阳性对照：**加密**的 66（payload ≥ 28）不是本判据的目标，照常按方向转发。
+	// 没有这一格，上面的阴性断言可以靠「66 一律丢」假绿。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 66, encryptedNonHeartbeatPayload(2)))
+	ef := expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(66), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(t, ef))
+
+	// 开关面：--streamreq-disable 打开后明文 66 放行（上游选项语义不变）。
+	m.StreamReqDisable = true
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 66, []byte{0, 0, 0, 1, 0}))
+	ef = expectFrame(t, px4, 1*time.Second)
+	require.Equal(t, uint32(66), ef.Frame.GetMessage().GetID(),
+		"StreamReqDisable 没有关掉拦截 ⇒ 该开关形同虚设")
+}
+
+// TestMultipleVehicleEndpointsRouteByDeviceID 钉住「多个载具端点」的装配：每个载具端点
+// 都映射为同一个 roleVehicle，选哪台 PX4 只由帧头 deviceID 决定，与来源端口无关。
+//
+// 云端只用一个载具端点，但 Config 的契约是「至少一个」，且 roleOf 对
+// VehicleEndpoints 是循环匹配 —— 多处端点时若某个端点没被认出来，该端口上的飞机
+// 会全部表现为「上线即丢帧」。本用例用两个真实载具端口把这条路径走通。
+func TestMultipleVehicleEndpointsRouteByDeviceID(t *testing.T) {
+	node, m, vehiclePorts, gcsPort, stop := newServerN(t, 2)
+	defer stop()
+
+	const didB = px4DeviceID + 7
+
+	qgc := connectQGC(t, node, gcsPort)
+	px4A := connectPX4(t, node, vehiclePorts[0])
+	px4B := connectPX4(t, node, vehiclePorts[1])
+
+	aInc, aCom, aSys, aComp := didBytes(px4DeviceID)
+	bInc, bCom, bSys, bComp := didBytes(didB)
+
+	// 一台 QGC 同时声明两台飞机
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID, didB)))
+	// 两台飞机各自从自己的载具端口上线
+	feed(m, px4A.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
+	feed(m, px4B.ch, makeFrame(bInc, bCom, bSys, bComp, 0, standbyHeartbeatPayload()))
+	// 两条待命心跳都要扇出到该 QGC（顺序不定）
+	_ = expectFrame(t, qgc, 1*time.Second)
+	_ = expectFrame(t, qgc, 1*time.Second)
+
+	// 上行发往 A ⇒ 只投给 A（按 deviceID 选目标，而不是「随便哪个载具端点」）
+	feed(m, qgc.ch, makeFrame(aInc, aCom, aSys, aComp, 33, encryptedPayload(1)))
+	ef := expectFrame(t, px4A, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	expectNoFrame(t, px4B, 300*time.Millisecond)
+
+	// B 的下行 ⇒ 投给配对的 QGC（帧头 deviceID 决定它属于哪台飞机）
+	feed(m, px4B.ch, makeFrame(bInc, bCom, bSys, bComp, 33, encryptedPayload(2)))
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(t, ef))
 }

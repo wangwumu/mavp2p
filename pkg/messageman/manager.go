@@ -1,6 +1,7 @@
 // Package messageman contains the message manager.
 // 有状态会话路由器（协议 10_deviceID与payload加密公共规范.md §3.2）：
-// 按帧头 deviceID 号段 + 来源 socketID（channel）+ msgID/payload 长度路由，
+// 按帧头 deviceID 号段 + **入口端点角色（方向）** + msgID/payload 长度路由。
+// 来源 channel 只用作登记与配对表的键，不参与方向判定；counter 只做防重放比较。
 // 不解密、不认证，把加密任务帧按原样透传。
 package messageman
 
@@ -41,7 +42,8 @@ const (
 	msgIDRequestDataStream = 66
 )
 
-// Config 会话路由器配置（附录 A.1）。零值字段使用默认值。
+// Config 会话路由器配置（附录 A.1）。除入口端点外，零值字段使用默认值；
+// 入口端点是**必填**的（零值 Config 非法），因为它们就是方向判据。
 type Config struct {
 	// 是否禁用 RequestDataStream 拦截（上游功能，默认拦截）。
 	StreamReqDisable bool
@@ -53,6 +55,60 @@ type Config struct {
 	MapTTL time.Duration
 	// 长期状态表空闲回收阈值（默认 DefaultStateIdleTimeout）。
 	StateIdleTimeout time.Duration
+	// GCSEndpoint 地面站入口端点（QGC→mavp2p 的上行），**恰好一个**。
+	// ‼️ 方向由**入口端点**决定：本端点进来的帧一律按上行处理，
+	// VehicleEndpoints 进来的帧一律按下行处理。不读 counter 奇偶，
+	// 也不再用 qgcOnline 的成员资格判方向。
+	// ‼️ 必须是传给 gomavlib.Node.Endpoints 的**同一个对象**（接口值相等）：
+	// roleOf 按身份判定来源，另建一个地址相同的新端点会让所有帧判成「无角色」。
+	// Initialize 会与 Node.Endpoints 交叉校验，不一致即拒绝启动。
+	GCSEndpoint gomavlib.Endpoint
+	// VehicleEndpoints 载具入口端点（PX4→mavp2p 的下行），至少一个。
+	// 同一批对象、同一身份要求同 GCSEndpoint。
+	VehicleEndpoints []gomavlib.Endpoint
+}
+
+// role 是通道的入口角色，由它所属的端点决定。
+type role uint8
+
+const (
+	roleUnknown role = iota
+	roleGCS
+	roleVehicle
+)
+
+// direction 是帧在入口处确定的传输方向，只有两个合法值。
+// ‼️ 零值 dirInvalid 表示「无法判定」（入口角色未知），不得进入路由函数；
+// processEncrypted 在入口显式拒绝它，避免第三个值落进某个分支。
+type direction uint8
+
+const (
+	dirInvalid direction = iota
+	dirUplink
+	dirDownlink
+)
+
+func (d direction) String() string {
+	switch d {
+	case dirUplink:
+		return "uplink"
+	case dirDownlink:
+		return "downlink"
+	default:
+		return "invalid"
+	}
+}
+
+// Opposite 返回反方向（用于双方向水位联动续期）；dirInvalid 没有反方向。
+func (d direction) Opposite() direction {
+	switch d {
+	case dirUplink:
+		return dirDownlink
+	case dirDownlink:
+		return dirUplink
+	default:
+		return dirInvalid
+	}
 }
 
 // px4Entry PX4 映射表项：deviceID → 当前可达 socketID（channel）。
@@ -106,10 +162,12 @@ type pairEntry struct {
 	lastTraffic time.Time
 }
 
-// nonceKey 边缘防重放键：deviceID × 方向（上行奇数 / 下行偶数）。
+// nonceKey 边缘防重放键：deviceID × 方向。
+// 方向取**入口端点角色**（GCS 端点 = 上行 / 载具端点 = 下行），不读 counter 的奇偶。
+// 键只由 direction 构造，不会取到 dirInvalid。
 type nonceKey struct {
 	deviceID uint32
-	odd      bool
+	dir      direction
 }
 
 // nonceEntry 防重放水位 + 最近一次推进时间。时间戳只用于 prune 的空闲回收。
@@ -195,6 +253,55 @@ type Manager struct {
 	regDiag    map[*gomavlib.Channel]regDiagEntry // QGC 通道 → 上次**落日志**的签名 + 上次打印时刻
 	hbDiag     map[uint32]time.Time               // deviceID → 上次待命心跳扇出日志时间（5s 节流）
 	fanoutDiag map[uint32]time.Time               // deviceID → 上次下行扇出日志时间（10s 节流）
+	// dropDiag 入口闸告警节流：通道 → 上次打印时刻 + 原因（即格式串）。
+	// 主清理路径是通道关闭；关闭事件可能漏（见 prune 的 pairs 兜底注释），故 prune 另按
+	// StateIdleTimeout 兜底回收。
+	// 端口接反时两种形态都是持续高频（PX4 待命心跳 20Hz 打到 GCS 口、QGC 心跳打到载具口），
+	// 逐帧打印会淹没真正有用的日志。但**原因也参与节流判定**：同一通道 10s 内换了原因
+	// （不同调用点，例如先打「明文心跳打错口」再打「80005 打错口」）时，新原因的首次出现
+	// 仍会打印一次——否则先到的那条会把这个窗口里所有别的告警一起吞掉。
+	dropDiag map[*gomavlib.Channel]dropDiagEntry
+}
+
+// dropDiagEntry 是 logDropThrottled 的节流状态：上次打印时刻 + 原因。
+type dropDiagEntry struct {
+	at     time.Time
+	reason string
+}
+
+// roleOf 按通道所属的端点判定入口角色。
+//
+// 这是**唯一**的方向判据：GCS 端点进来的帧是上行，载具端点进来的是下行。
+// 不再读 counter 的奇偶（§2.3 的 nonce LSB 只是发送端的约定，不是路由依据），
+// 也不再用 qgcOnline 的成员资格判方向（那张表只回答「登记过没有」）。
+func (m *Manager) roleOf(ch *gomavlib.Channel) role {
+	if ch == nil {
+		return roleUnknown
+	}
+	ep := ch.Endpoint()
+	if ep == nil {
+		return roleUnknown
+	}
+	if ep == m.GCSEndpoint {
+		return roleGCS
+	}
+	for _, v := range m.VehicleEndpoints {
+		if ep == v {
+			return roleVehicle
+		}
+	}
+	return roleUnknown
+}
+
+// hasEndpoint 按接口值相等（身份）判断 eps 里有没有 ep。
+// 所有 gomavlib 端点实现的动态类型都是指针，接口比较不会 panic。
+func hasEndpoint(eps []gomavlib.Endpoint, ep gomavlib.Endpoint) bool {
+	for _, v := range eps {
+		if v == ep {
+			return true
+		}
+	}
+	return false
 }
 
 // gcsDeviceIDMax 返回配置的号段分界（0=默认）。
@@ -249,8 +356,8 @@ func (m *Manager) validAircraftDeviceID(d uint32) bool {
 // ⇒ 上行水位的 lastSeen 停在最后一条真实上行上，10 分钟后被 prune 回收。窗口一重开，
 // 一条重放的旧上行就能通过判据 —— 而这条链路其实一直活跃。
 // 口径：任一方向有真实转发 ⇒ 整条链路都活跃 ⇒ 两个方向一起续期。
-func (m *Manager) touchSiblingNonce(did uint32, odd bool, now time.Time) {
-	k := nonceKey{deviceID: did, odd: !odd}
+func (m *Manager) touchSiblingNonce(did uint32, current direction, now time.Time) {
+	k := nonceKey{deviceID: did, dir: current.Opposite()}
 	if e, ok := m.lastNonce[k]; ok {
 		e.lastSeen = now
 		m.lastNonce[k] = e
@@ -272,6 +379,48 @@ func (m *Manager) Initialize() error {
 	if m.MaxQGCLinkedPX4 < 0 {
 		return fmt.Errorf("messageman: MaxQGCLinkedPX4 must not be negative (got %d)", m.MaxQGCLinkedPX4)
 	}
+	// 方向只由入口端点决定 ⇒ 两个角色都必须有且互不重叠。缺一个就拒绝启动，
+	// 不允许退化成「靠 counter 奇偶猜」——那正是本次要删掉的判据。
+	if m.GCSEndpoint == nil {
+		return fmt.Errorf("messageman: GCSEndpoint is required (direction is decided by the ingress endpoint)")
+	}
+	if len(m.VehicleEndpoints) == 0 {
+		return fmt.Errorf("messageman: VehicleEndpoints must not be empty")
+	}
+	configured := append([]gomavlib.Endpoint{m.GCSEndpoint}, m.VehicleEndpoints...)
+	for _, ep := range configured {
+		if ep == nil {
+			return fmt.Errorf("messageman: ingress endpoints must not be nil")
+		}
+	}
+	for _, ep := range m.VehicleEndpoints {
+		if ep == m.GCSEndpoint {
+			return fmt.Errorf("messageman: GCSEndpoint must not also appear in VehicleEndpoints")
+		}
+	}
+	// 与 Node.Endpoints 交叉校验。roleOf 按接口值相等认来源，端点只要不是「同一批
+	// 对象」，落到该端口的每一帧都会判成 roleUnknown 并被丢弃 —— 症状是「进程起来了、
+	// 端口也监听着，但一帧都不转发」，只能从入口闸告警里看出来。装配错误必须在启动期暴露。
+	if m.Node == nil {
+		return fmt.Errorf("messageman: Node is required (endpoint roles are cross-checked against Node.Endpoints)")
+	}
+	if len(m.Node.Endpoints) != len(configured) {
+		return fmt.Errorf("messageman: Node.Endpoints has %d entries, want %d "+
+			"(one GCSEndpoint + %d vehicle endpoints); extra endpoints would have no role",
+			len(m.Node.Endpoints), len(configured), len(m.VehicleEndpoints))
+	}
+	for _, want := range configured {
+		if !hasEndpoint(m.Node.Endpoints, want) {
+			return fmt.Errorf("messageman: configured endpoint %s is not the same object as any Node.Endpoints "+
+				"entry; frames from it would be dropped as roleUnknown", want)
+		}
+	}
+	for _, got := range m.Node.Endpoints {
+		if !hasEndpoint(configured, got) {
+			return fmt.Errorf("messageman: Node.Endpoints entry %s has no role; "+
+				"configure it as GCSEndpoint or in VehicleEndpoints", got)
+		}
+	}
 
 	m.px4Map = make(map[uint32]*px4Entry)
 	m.qgcOnline = make(map[*gomavlib.Channel]*qgcEntry)
@@ -281,6 +430,7 @@ func (m *Manager) Initialize() error {
 	m.regDiag = make(map[*gomavlib.Channel]regDiagEntry)
 	m.hbDiag = make(map[uint32]time.Time)
 	m.fanoutDiag = make(map[uint32]time.Time)
+	m.dropDiag = make(map[*gomavlib.Channel]dropDiagEntry)
 
 	m.Wg.Add(1)
 	go m.run()
@@ -311,8 +461,9 @@ func (m *Manager) run() {
 //  1. 路由存活（MAP_TTL）：映射/在线/配对。这些表靠 80005 与 PX4 心跳续命，秒级。
 //  2. 卫生（StateIdleTimeout，默认 10 分钟）：配对、防重放水位、诊断表。
 //     各表的计时源**不同**，别用一句话概括：配对按 `lastTraffic`（加密上行/下行，见下）、
-//     水位按 `lastSeen`（加密帧，双方向互续）、`hbDiag`/`fanoutDiag` 按各自的日志写入时刻、
-//     `regDiag` 则不看时间而是看「通道是否还在 qgcOnline」。80005 周期登记不算流量。
+//     水位按 `lastSeen`（加密帧，双方向互续）、`hbDiag`/`fanoutDiag`/`dropDiag` 按各自的
+//     日志写入时刻、`regDiag` 则不看时间而是看「通道是否还在 qgcOnline」。80005 周期登记
+//     不算流量。
 //
 // lastNonce 的空闲回收是 2026-10-24 新增的：改前只有「PX4 回待命」一条清路，长期运行的
 // 进程里水位表随历史 deviceID 数只增不减。代价按 2026-10-24 决策接受：设备空闲超过阈值
@@ -325,7 +476,7 @@ func (m *Manager) prune() {
 	idle := m.stateIdleTimeout()
 
 	// 本轮卫生回收的计数（只为打一行汇总，避免逐条刷屏；配对回收另有逐条日志）。
-	var nNonces, nRegDiag, nHb, nFanout int
+	var nNonces, nRegDiag, nHb, nFanout, nDrop int
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -395,7 +546,7 @@ func (m *Manager) prune() {
 			// 逐条带 deviceID + 方向：回收意味着该方向防重放窗口**重开**（见 nonceEntry），
 			// 之后可能出现一条被放行的重复帧。没有这条日志，运维无法把「偶发重复」对上回收事件。
 			log.Printf("nonce idle-purged: deviceID=%d direction=%s counter=%d idle=%s",
-				k.deviceID, dirName(k.odd), e.counter, now.Sub(e.lastSeen).Round(time.Second))
+				k.deviceID, k.dir, e.counter, now.Sub(e.lastSeen).Round(time.Second))
 			delete(m.lastNonce, k)
 			nNonces++
 		}
@@ -423,9 +574,19 @@ func (m *Manager) prune() {
 			nFanout++
 		}
 	}
-	if nNonces+nRegDiag+nHb+nFanout > 0 {
-		log.Printf("state purge: nonces=%d regDiag=%d hbDiag=%d fanoutDiag=%d",
-			nNonces, nRegDiag, nHb, nFanout)
+	// dropDiag（入口闸告警节流）的键是通道指针，主清理路径是 ProcessChannelClose。那条路径
+	// 有漏（配对表实测「18 开 / 17 闭」，见上方 pairs 的兜底注释）：漏掉的通道会把指针永久
+	// 留在这里，而每次 NAT 重建都是一条新 channel ⇒ 同样只增不减。按空闲时间补一道兜底；
+	// 判据取「上次打告警的时刻」，与 hbDiag/fanoutDiag 一致。
+	for ch, e := range m.dropDiag {
+		if now.Sub(e.at) >= idle {
+			delete(m.dropDiag, ch)
+			nDrop++
+		}
+	}
+	if nNonces+nRegDiag+nHb+nFanout+nDrop > 0 {
+		log.Printf("state purge: nonces=%d regDiag=%d hbDiag=%d fanoutDiag=%d dropDiag=%d",
+			nNonces, nRegDiag, nHb, nFanout, nDrop)
 	}
 }
 
@@ -452,6 +613,9 @@ func rawPayloadLen(msg message.Message) int {
 }
 
 // ProcessFrame 处理一个 EventFrame。
+//
+// 入口角色由通道所属端点决定（roleOf），这是**唯一**的上下行判据；counter 的
+// 奇偶与 qgcOnline 的成员资格都不再参与方向判定。
 func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 	fr := evt.Frame
 	srcCh := evt.Channel
@@ -460,8 +624,22 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 	did := frameDeviceID(fr)
 	plen := rawPayloadLen(msg)
 
-	// 明文 RequestDataStream 拦截（上游功能保留）：仅明文（payload<28）拦截，
-	// 加密帧（payload 含 counter/密文）不拦——由会话路由透传。
+	r := m.roleOf(srcCh)
+	var dir direction
+	switch r {
+	case roleGCS:
+		dir = dirUplink
+	case roleVehicle:
+		dir = dirDownlink
+	default:
+		// 生产装配下不可达：Initialize 已与 Node.Endpoints 交叉校验。
+		// 保留这一支只为在编程/配置错误时显式失败，而不是把帧塞进某个方向。
+		m.logDropThrottled(srcCh, "frame from channel with unknown endpoint role: %s; dropping", srcCh)
+		return
+	}
+
+	// 明文 RequestDataStream 拦截（上游功能保留）：与入口角色无关，明文一律拦。
+	// 加密的 66（payload ≥ encryptedPayloadMinLen）不是本判据的目标，照常按方向路由。
 	if !m.StreamReqDisable && msgID == msgIDRequestDataStream &&
 		(plen < 0 || plen < encryptedPayloadMinLen) {
 		return
@@ -470,18 +648,62 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 	switch {
 	case msgID == msgIDQGCRegistration:
 		// QGC 明文登记/保活心跳（§3.2 步骤 2）：仅 mavp2p 消费，不转发。
+		// 只允许从地面站入口进来；出现在载具入口 = 客户端配错端口，丢弃并告警。
+		if dir != dirUplink {
+			m.logDropThrottled(srcCh, "dropped 80005 registration on vehicle endpoint from %s "+
+				"(is the QGC still pointed at a vehicle port? it must use --gcs-endpoint)", srcCh)
+			return
+		}
 		m.processRegistration(srcCh, did, msg)
 
 	case msgID == msgIDHeartbeat && did >= m.gcsDeviceIDMax() &&
 		plen >= 0 && plen < encryptedPayloadMinLen:
-		// PX4 明文待命心跳（§3.2.2 步骤 1/10）：登记映射 + 扇出在线 QGC；
+		// PX4 明文待命心跳（§3.2.2 步骤 1/10）：登记映射 + 扇出在线 QGC。
+		// 只允许从载具入口进来；地面站入口出现明文心跳 = 配错端口或伪造。
+		if dir != dirDownlink {
+			m.logDropThrottled(srcCh, "dropped plaintext heartbeat on GCS endpoint from %s "+
+				"(deviceID=%d; is the PX4 pointed at the GCS port? it must use a vehicle endpoint)", srcCh, did)
+			return
+		}
+		// 号段闸：上面的 case 只比了下界，上界与 bit24 也必须判，且口径与 80005 登记、
+		// 加密下行重建完全一致。否则一帧 9B 明文心跳（id 取 0x80016379 之类）就能在
+		// px4Map 里种出「幻象 PX4」并扇出给所有在线 QGC —— 而随后该 id 的加密下行会
+		// 在「缓存命中」分支直接通过，绕过加密下行那一侧的号段闸。
+		if !m.validAircraftDeviceID(did) {
+			m.logDropThrottled(srcCh, "dropped plaintext heartbeat with invalid deviceID=%d from %s: "+
+				"outside aircraft segment", did, srcCh)
+			return
+		}
 		// 仅当该 deviceID 有下行水位（经历过加密会话，即任务结束）才清配对。
 		m.processStandbyHeartbeat(srcCh, did, fr)
 
 	default:
-		// 加密任务帧（含加密 HEARTBEAT，msgID=0 且 payload≥28）：按会话路由定向。
-		m.processEncrypted(srcCh, did, fr)
+		// 加密任务帧（含加密 HEARTBEAT，msgID=0 且 payload≥28）：按入口方向定向。
+		m.processEncrypted(srcCh, did, fr, dir)
 	}
+}
+
+// kDropLogInterval 入口闸告警的通道级节流窗口。
+// 端口接反时帧率很高（PX4 待命心跳 20Hz、QGC 心跳 1Hz），逐帧打印没有额外信息量。
+const kDropLogInterval = 10 * time.Second
+
+// logDropThrottled 打一条入口闸告警：同一通道、同一原因 10s 内最多一条。
+// 原因取格式串（同一调用点恒定）；换了原因会重新放行一次，见 dropDiag 的注释。
+func (m *Manager) logDropThrottled(ch *gomavlib.Channel, format string, args ...any) {
+	now := time.Now()
+	m.mu.Lock()
+	// 内部用例直接构造 Manager（不走 Initialize），这里懒初始化，与 fanoutDiag 同口径。
+	if m.dropDiag == nil {
+		m.dropDiag = make(map[*gomavlib.Channel]dropDiagEntry)
+	}
+	if last, ok := m.dropDiag[ch]; ok && last.reason == format &&
+		now.Sub(last.at) < kDropLogInterval {
+		m.mu.Unlock()
+		return
+	}
+	m.dropDiag[ch] = dropDiagEntry{at: now, reason: format}
+	m.mu.Unlock()
+	log.Printf(format, args...)
 }
 
 // registrationDeviceIDAt 读 80005 payload 里第 i 个 deviceID（i 从 0 起）。
@@ -638,8 +860,8 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 	// 能走到空闲回收就说明该配对的 lastTraffic 也同样陈旧，下一次 prune 会按空闲闸清掉它。
 	// 前提：PX4 不允许崩溃重启（PX4 侧状态连续，不会凭空退回待命）；mavp2p/QGC 重启则
 	// 两侧水位一并清空，也不落入该窗口。
-	nkUp := nonceKey{deviceID: did, odd: true}
-	nkDown := nonceKey{deviceID: did, odd: false}
+	nkUp := nonceKey{deviceID: did, dir: dirUplink}
+	nkDown := nonceKey{deviceID: did, dir: dirDownlink}
 	if _, hadDown := m.lastNonce[nkDown]; hadDown {
 		for k := range m.pairs {
 			if k.px4DeviceID == did {
@@ -648,7 +870,7 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 		}
 	}
 	// 水位照清，与配对是两件事（§2.5：任务结束 PX4 软重置**两个方向**的 lastNonce 为
-	// unset，奇/偶各一条；新任务 QGC 取随机 62 位奇数起点）。若 mavp2p 不清，新 QGC 随机
+	// unset，上行/下行各一条；新任务 QGC 取随机 62 位奇数起点）。若 mavp2p 不清，新 QGC 随机
 	// 起点若低于旧任务水位会被边缘判重误杀（≈50% 概率阻塞新任务上行，直到 counter 追平）。
 	// 清后仅重开防重放窗口（协议 §2.5「重启边界」已接受的残余风险）。
 	// ❗ 2026-09-28 起**下游不再兜底**：data_writer 已按 §2.6「data_writer 例外」删除判重
@@ -688,57 +910,63 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 }
 
 // processEncrypted 处理加密任务帧（§3.2.2 步骤 3/4/8）。
-func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame.Frame) {
+//
+// 方向由入口端点决定（d 由 ProcessFrame 从 roleOf 映射而来），**不读 counter 奇偶**，
+// 也不靠 qgcOnline 成员资格判方向；counter 只用于防重放水位的数值比较。
+// d 必须是 dirUplink/dirDownlink 之一：dirInvalid 在这里被拒绝，不让「第三态」落进某个分支。
+func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame.Frame, d direction) {
+	if d != dirUplink && d != dirDownlink {
+		// ProcessFrame 已在前置映射处丢弃未知角色；这里是防御性第二道，不静默选边。
+		m.logDropThrottled(srcCh, "processEncrypted called with invalid direction (%d) from %s; dropping", d, srcCh)
+		return
+	}
 	// 边缘防重放（§3.1）：读 payload 明文 counter（前 8 字节），按 deviceID×方向 判重。
 	// 尽力而为、不认证；端到端的权威判重在各**解密方**（PX4 / QGC 各自维护）。
 	// ❗ data_writer 不在其中：它 2026-09-28 起按 §2.6「data_writer 例外」删除了判重
 	// （用户裁定）⇒ 对 FIFO 这条消费路径，本函数就是唯一的一道。counter 为 0 或取不到则不判。
 	// 注意：lastNonce 的写入延后到「确认本帧会被路由」之后——被拦截/忽略的帧不推进
-	// 防重放水位，避免未登记 QGC 上行（被忽略）推进奇数水位、误杀后续合法上行。
+	// 防重放水位，避免未登记 QGC 上行（被忽略）推进上行水位、误杀后续合法上行。
 	// （下行帧即便无配对接收者，也会因刷新状态而推进水位。）
 	// plen 同时用于识别加密心跳（msgID=0 且 ≥ encryptedPayloadMinLen，§2.5）。
 	msg := fr.GetMessage()
 	msgID := msg.GetID()
 	var counter uint64
-	odd := false
 	plen := -1
 	if raw, ok := msg.(*message.MessageRaw); ok {
 		plen = len(raw.Payload)
 		if plen >= 8 {
 			counter = binary.BigEndian.Uint64(raw.Payload[0:8])
-			odd = counter&1 == 1 // 上行（QGC）奇数 / 下行（PX4/abc_vtol）偶数
 		}
 	}
-
 	m.mu.Lock()
 
 	// 防重放判定（读，不写）：同方向同 deviceID 的 counter 不递增则丢弃。
+	// 方向来自入口端点 ⇒ 水位键也用方向，与 counter 的数值/奇偶无关。
 	var nk *nonceKey
 	if counter != 0 {
-		k := nonceKey{deviceID: did, odd: odd}
+		k := nonceKey{deviceID: did, dir: d}
 		if last, ok := m.lastNonce[k]; ok && counter <= last.counter {
 			m.mu.Unlock()
-			log.Printf("dropped replayed frame deviceID=%d %s counter=%d from %s", did, dirName(odd), counter, srcCh)
+			log.Printf("dropped replayed frame deviceID=%d %s counter=%d from %s", did, d, counter, srcCh)
 			return
 		}
 		nk = &k
 	}
 
-	// 方向判定（§3.2.3）：来源 socketID ∈ QGC 在线表 → 上行；
-	// 否则 → 若 counter 为偶数/0 按 PX4 下行处理（§3.2.2 步骤 8 放宽下行判据：漂移时
-	// 来源 socketID 可能与映射表记录不一致）；奇数 counter 的未登记上行先被下方 odd
-	// 判据拦截（见下）。加密帧帧头 deviceID 恒为该链路 PX4 的 D——对下行帧而言它同时
-	// 是发送方自身（§3.2.1 核心规则）；不得仅凭号段判方向，也不得把「来源 == PX4 映射
-	// socketID」作为判下行的前提（漂移时可能不等）。
-	if _, isQGC := m.qgcOnline[srcCh]; isQGC {
+	// 方向：入口端点唯一决定，GCS 端点 = 上行，载具端点 = 下行。
+	if d == dirUplink {
 		now := time.Now()
 		// ---- 上行（QGC → PX4）：帧头 deviceID = 目标 PX4 的 D（§3.2.3）----
-		// 活跃加密上行维持 QGC 在线身份（§3.2.3 保活约束：QGC 在线表靠登记/保活维护，
-		// 避免活跃会话被 MAP_TTL 误清理后再落入非 QGC 分支）；先刷新，使「上行→未知
-		// PX4」路径也维持在线身份
-		if qe, ok := m.qgcOnline[srcCh]; ok {
-			qe.lastSeen = now
+		// 登记是**授权/订阅**闸，不是方向判据：没发过 80005 的地面站通道不得注入上行。
+		// 同一张查表顺带刷新在线身份（§3.2.3 保活约束），使「上行→未知 PX4」路径也
+		// 维持在线状态；先刷新可避免活跃会话被 MAP_TTL 误清理后上行因登记闸被丢。
+		qe, ok := m.qgcOnline[srcCh]
+		if !ok {
+			m.mu.Unlock()
+			log.Printf("received uplink from unregistered GCS channel %s for PX4 deviceID=%d, ignoring", srcCh, did)
+			return
 		}
+		qe.lastSeen = now
 		px4, ok := m.px4Map[did]
 		if !ok {
 			// 目标 PX4 未上线（无映射缓存）→ 忽略，等 PX4 待命心跳 + QGC 80005
@@ -772,7 +1000,7 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		}
 		if nk != nil {
 			m.lastNonce[*nk] = nonceEntry{counter: counter, lastSeen: now}
-			m.touchSiblingNonce(did, odd, now)
+			m.touchSiblingNonce(did, d, now)
 		}
 		target := px4.channel // 锁内快照，锁外转发避免锁后读竞争
 		m.mu.Unlock()
@@ -784,44 +1012,53 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		return
 	}
 
-	// 非 QGC 来源 + 奇数 counter = 上行特征：未登记/登记过期的 QGC 加密上行帧
-	// （帧头 deviceID = 目标 PX4 的 D）。不得按下行处理改写 PX4 映射表——否则上行命令
-	// 被重定向、可能跨 QGC 泄露。忽略，等该 QGC 补发 80005（§3.2.4.1 幂等重建）。
-	if odd {
-		m.mu.Unlock()
-		log.Printf("received uplink from unregistered channel %s for PX4 deviceID=%d, ignoring", srcCh, did)
-		return
-	}
-
-	// ---- 下行（PX4 → QGC）：帧头 deviceID = 发送方自身，counter 恒为偶数/0 ----
+	// ---- 下行（PX4 → QGC）：帧头 deviceID = 发送方自身 ----
+	// 走到这里一定来自载具端点（GCS 端点在上方 dirUplink 分支已 return），
+	// 所以「未登记的地面站上行」不可能落到这里改写 px4Map。
 	px4, ok := m.px4Map[did]
+	now := time.Now()
 	if !ok {
-		// 该 deviceID 无映射缓存 → 非本链路已知 PX4 的帧，丢弃
-		m.mu.Unlock()
-		log.Printf("received encrypted frame for unknown PX4 deviceID=%d %s from %s, discarding", did, dirName(odd), srcCh)
-		return
+		// 缓存缺失 ≠ 非本系统飞机（§3.2.4.1「查不到缓存就新建」）：mavp2p 在飞机**已进入
+		// 加密阶段**时重启（QGC 未退出）后，PX4 不会再发明文待命心跳，重建只能靠本帧帧头
+		// deviceID（= 发送方自身）。若在此丢弃，飞机落地前整条下行都无法自愈。
+		//
+		// 但仍须过号段闸：帧头来自载具端点不等于它一定是飞机。QGC 被误指到载具端口、
+		// 或内网任意主机向该端口发一帧，都能凭一个 GCS 段/保留段 deviceID 造出"幻象 PX4"，
+		// 并把后续真遥测判成重放。号段口径与 80005 登记、QGC 侧过滤完全一致。
+		// 号段合法的帧仍不验证内容（路由器不解密），剩余风险由 §2.1.1 部署网络边界兜底。
+		if !m.validAircraftDeviceID(did) {
+			m.mu.Unlock()
+			m.logDropThrottled(srcCh,
+				"dropped downlink for invalid deviceID=%d from %s: outside aircraft segment",
+				did, srcCh)
+			return
+		}
+		px4 = &px4Entry{channel: srcCh, lastSeen: now}
+		m.px4Map[did] = px4
+		log.Printf("PX4 appeared (rebuilt from downlink): deviceID=%d channel=%s", did, srcCh)
 	}
 	// socketID 漂移刷新（§3.2.1 核心规则 / §3.2.2 步骤 8 / §3.2.3）：PX4 经 5G 动态地址
 	// NAT 重建后 socketID 会变，每次收到 PX4 帧都比对来源 socketID，变化即以 deviceID
 	// 定位原表项并更新，否则后续定向转发全部落空。
-	// 安全边界：本分支承担**两项**无密码学认证的状态变更（与待命心跳登记一样）——
-	//   ① socketID 重定向（见下）：任何未登记为 QGC 的来源，发一帧**偶数 counter/0**、
-	//      帧头 deviceID 命中已知 PX4 的帧即可触发；
-	//   ② 置位「已建链标记」（见下方「握手完成置位」）：该帧若同时满足 `msgID=0 且
+	// 安全边界：本分支承担**三项**无密码学认证的状态变更（与待命心跳登记一样）——
+	//   ① 新建 PX4 缓存（上方未命中分支，§3.2.4.1「查不到缓存就新建」；已限定为合法
+	//      飞机号段，非法号段在重建前即被丢弃）；
+	//   ② socketID 重定向（见下）：任何来源，只要从**载具端点**发一帧帧头 deviceID
+	//      命中已知 PX4 的帧即可触发；
+	//   ③ 置位「已建链标记」（见下方「握手完成置位」）：该帧若同时满足 `msgID=0 且
 	//      plen >= encryptedPayloadMinLen`，即把该 PX4 置为已建链，**使其 QGC 加密心跳被拦**。
-	// 两项的剩余触发面都只是部署边界内的注入——登记过期的合法 QGC 上行恒为奇数，已被
-	// 上方 odd 判据拦截。两项风险同由 §2.1.1 部署网络边界（mavp2p 不落公网、内网/VPN/IP
-	// 白名单）保障，协议层不为这些状态额外设计认证（§3.2.3「无认证路由状态的安全依赖」）。
+	// 三者触发面都限定在「能向载具端点发包的来源」——QGC 走独立端口，其帧在入口就被
+	// 归为上行，结构上到不了本分支。剩余风险由 §2.1.1 部署网络边界（mavp2p 不落公网、
+	// 内网/VPN/IP 白名单）保障，协议层不为这些状态额外设计认证
+	// （§3.2.3「无认证路由状态的安全依赖」）。
 	if px4.channel != srcCh {
 		log.Printf("PX4 socketID drifted: deviceID=%d %s -> %s", did, px4.channel, srcCh)
 		px4.channel = srcCh
 	}
-	now := time.Now()
 	px4.lastSeen = now
 	// 握手完成置位（§2.5）：PX4 发来**加密** HEARTBEAT ⇒ 它的加密链路已建成，此后
 	// mavp2p 拦截 QGC 发往该 deviceID 的加密 GCS 心跳。判据只用 msgID 与长度、不解密；
-	// 置位点必须在本分支 px4Map 命中之后（未命中在更上方已早退），否则未知 deviceID
-	// 的加密帧也能置位。
+	// 置位点必须在本分支 px4Map 命中/重建之后，否则该分支根本走不到这里。
 	if msgID == msgIDHeartbeat && plen >= encryptedPayloadMinLen && !px4.handshaked {
 		px4.handshaked = true
 		log.Printf("PX4 handshake complete: deviceID=%d (%s), GCS heartbeats blocked", did, srcCh)
@@ -885,7 +1122,7 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		m.lastNonce[*nk] = nonceEntry{counter: counter, lastSeen: now}
 		// 下行活跃 ⇒ 上行水位一并续期：活跃会话里 QGC 的上行心跳被 §2.5 拦截、不推进
 		// 上行水位，只靠上行刷新会让它在 10 分钟后被回收（见 touchSiblingNonce 的注释）。
-		m.touchSiblingNonce(did, odd, now)
+		m.touchSiblingNonce(did, d, now)
 	}
 	// 空扇出：PX4 加密下行但无配对任务 QGC（典型：QGC 配对被 MAP_TTL 剪除而 PX4 仍
 	// 持续下行）。节流打日志（每 deviceID 10s 一次），避免高频遥测下刷屏。
@@ -968,12 +1205,7 @@ func (m *Manager) ProcessChannelClose(evt *gomavlib.EventChannelClose) {
 			delete(m.pairs, k)
 		}
 	}
-}
-
-// dirName 返回方向描述（日志用）。
-func dirName(odd bool) string {
-	if odd {
-		return "uplink(odd)"
-	}
-	return "downlink(even)"
+	// 入口闸告警节流表按通道持有指针，通道关闭即回收；否则接反端口的短命通道会
+	// 在这张表里无限累积（每次 NAT 重建都是一条新 channel）。
+	delete(m.dropDiag, ch)
 }

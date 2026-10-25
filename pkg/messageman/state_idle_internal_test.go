@@ -14,7 +14,8 @@ import (
 )
 
 // idleTestUplinkFrame 构造一帧 QGC 加密上行：帧头 deviceID = 目标 PX4 的 did（§3.2.3），
-// 奇数 counter（上行特征）。msgID 取非心跳值，避开 §2.5 的加密心跳拦截。
+// counter 取奇数（照发送端约定，**不是**路由依据；本文件的用例直接传 dirUplink）。
+// msgID 取非心跳值，避开 §2.5 的加密心跳拦截。
 func idleTestUplinkFrame(did uint32, counter uint64) *frame.V2Frame {
 	payload := make([]byte, 8+4)
 	binary.BigEndian.PutUint64(payload[:8], counter)
@@ -181,7 +182,7 @@ func TestEncryptedDownlinkRefreshesPairTraffic(t *testing.T) {
 
 	// 同一 channel 指针同时当 PX4 来源与配对 QGC ⇒ 扇出末尾的 `qgc != srcCh` 跳过写，
 	// Node 可留 nil（与 TestPX4DownlinkKeepsPairButNotFanout 同一手法）。
-	m.processEncrypted(ch, did, downlinkFrame(did, 2))
+	m.processEncrypted(ch, did, downlinkFrame(did, 2), dirDownlink)
 
 	e, ok := m.pairs[pk]
 	require.True(t, ok, "配对项不该被下行帧删掉")
@@ -194,8 +195,9 @@ func TestEncryptedUplinkRefreshesPairTraffic(t *testing.T) {
 	const did = uint32(10000002)
 
 	m := newBareManager()
-	// 同一 channel 指针同时当 QGC 来源与 PX4 目标：方向由 qgcOnline 成员资格判定，
-	// 而转发末尾 `target != srcCh` 会跳过写 ⇒ Node 可留 nil（同 TestPX4Downlink… 的手法）。
+	// 同一 channel 指针同时当 QGC 来源与 PX4 目标：方向由调用方传入的 direction 决定
+	// （本用例传 dirUplink），而转发末尾 `target != srcCh` 会跳过写 ⇒ Node 可留 nil
+	// （同 TestPX4Downlink… 的手法）。
 	ch := &gomavlib.Channel{}
 	stale := time.Now().Add(-2 * time.Hour)
 	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
@@ -203,7 +205,7 @@ func TestEncryptedUplinkRefreshesPairTraffic(t *testing.T) {
 	pk := pairKey{qgcCh: ch, px4DeviceID: did}
 	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale, lastTraffic: stale}
 
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3))
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
 
 	e, ok := m.pairs[pk]
 	require.True(t, ok, "配对项不该被上行帧删掉")
@@ -219,8 +221,8 @@ func TestPrunePurgesIdleNonce(t *testing.T) {
 	m := newBareManager()
 	m.StateIdleTimeout = time.Minute
 
-	idle := nonceKey{deviceID: 10000001, odd: true}
-	fresh := nonceKey{deviceID: 10000002, odd: false}
+	idle := nonceKey{deviceID: 10000001, dir: dirUplink}
+	fresh := nonceKey{deviceID: 10000002, dir: dirDownlink}
 	m.lastNonce[idle] = nonceEntry{counter: 5, lastSeen: time.Now().Add(-2 * time.Hour)}
 	m.lastNonce[fresh] = nonceEntry{counter: 6, lastSeen: time.Now()}
 
@@ -288,7 +290,9 @@ func TestInitializeRejectsNegativeDurations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	m := &Manager{Ctx: ctx, Wg: &wg}
+	gcsEP, vehEPs := testRoles()
+	m := &Manager{Ctx: ctx, Wg: &wg, Node: testNode(gcsEP, vehEPs),
+		Config: Config{GCSEndpoint: gcsEP, VehicleEndpoints: vehEPs}}
 	require.NoError(t, m.Initialize(), "零值配置被拒绝 ⇒ 默认路径不可用")
 	cancel()
 	wg.Wait()
@@ -309,12 +313,12 @@ func TestNonceSiblingDirectionRefreshed(t *testing.T) {
 	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now()}
 
 	stale := time.Now().Add(-2 * time.Hour)
-	downKey := nonceKey{deviceID: did, odd: false}
+	downKey := nonceKey{deviceID: did, dir: dirDownlink}
 	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: stale}
 
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3))
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
 
-	up, ok := m.lastNonce[nonceKey{deviceID: did, odd: true}]
+	up, ok := m.lastNonce[nonceKey{deviceID: did, dir: dirUplink}]
 	require.True(t, ok, "上行水位没有推进")
 	require.Equal(t, uint64(3), up.counter, "上行水位 counter 写错")
 
@@ -337,7 +341,8 @@ func TestNonceSiblingDirectionRefreshedByDownlink(t *testing.T) {
 	m := newBareManager()
 	// 同一 channel 指针同时当 PX4 来源与配对 QGC ⇒ 扇出末尾的 `qgc != srcCh` 跳过写，
 	// Node 可留 nil（与 TestEncryptedDownlinkRefreshesPairTraffic 同一手法）。
-	// 注意：该 channel 不能进 qgcOnline，否则方向判定会把它当上行。
+	// 注意：本用例传 dirDownlink，下行分支根本不读 qgcOnline —— 该表只在 dirUplink
+	// 分支充当登记/授权闸，不参与方向判定（方向已在 ProcessFrame 入口由端点定死）。
 	ch := &gomavlib.Channel{}
 	now := time.Now()
 	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: now}
@@ -346,10 +351,10 @@ func TestNonceSiblingDirectionRefreshedByDownlink(t *testing.T) {
 	}
 
 	stale := time.Now().Add(-2 * time.Hour)
-	upKey := nonceKey{deviceID: did, odd: true}
+	upKey := nonceKey{deviceID: did, dir: dirUplink}
 	m.lastNonce[upKey] = nonceEntry{counter: 3, lastSeen: stale}
 
-	m.processEncrypted(ch, did, downlinkFrame(did, 2))
+	m.processEncrypted(ch, did, downlinkFrame(did, 2), dirDownlink)
 
 	up, ok := m.lastNonce[upKey]
 	require.True(t, ok, "下行水位写入时把上行水位删了")
@@ -369,14 +374,14 @@ func TestActiveNonceWatermarkSurvivesPrune(t *testing.T) {
 	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
 	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now()}
 
-	downKey := nonceKey{deviceID: did, odd: false}
+	downKey := nonceKey{deviceID: did, dir: dirDownlink}
 	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: time.Now().Add(-2 * time.Hour)}
 
 	// 一帧真实上行（非心跳 ⇒ 不被 §2.5 拦截）：推进上行水位并给下行续期。
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3))
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
 	m.prune()
 
-	upKey := nonceKey{deviceID: did, odd: true}
+	upKey := nonceKey{deviceID: did, dir: dirUplink}
 	_, upKept := m.lastNonce[upKey]
 	require.True(t, upKept, "刚有真实上行的水位被 prune 回收了")
 	_, downKept := m.lastNonce[downKey]
@@ -438,7 +443,7 @@ func TestIdlePurgedPairIsRebuiltOnlyByRegistration(t *testing.T) {
 	require.False(t, ok, "前提自检失败：配对没被空闲闸回收，后面两格都在空转")
 
 	// 回收后的第一帧下行：不重建配对（已知代价）。
-	m.processEncrypted(px4Ch, did, downlinkFrame(did, 2))
+	m.processEncrypted(px4Ch, did, downlinkFrame(did, 2), dirDownlink)
 	_, ok = m.pairs[pk]
 	require.False(t, ok, "下行分支重建了配对 ⇒ 与实现口径不符，回收代价的前提变了")
 
@@ -468,7 +473,7 @@ func TestUplinkCreatedPairSurvivesPrune(t *testing.T) {
 	_, preExists := m.pairs[pk]
 	require.False(t, preExists, "夹具前提：配对应由本帧上行新建")
 
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3))
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
 
 	e, ok := m.pairs[pk]
 	require.True(t, ok, "加密上行没有建立配对（§3.2.2 步骤 3）")
@@ -598,7 +603,7 @@ func TestPruneReapsRegDiagWhenChannelExpiresInSameRound(t *testing.T) {
 // 「PX4 回待命」（§2.5）与 prune 的空闲闸。
 func TestChannelCloseKeepsNonceWatermark(t *testing.T) {
 	m := newBareManager()
-	key := nonceKey{deviceID: 10000001, odd: true}
+	key := nonceKey{deviceID: 10000001, dir: dirUplink}
 	m.lastNonce[key] = nonceEntry{counter: 7, lastSeen: time.Now()}
 
 	m.ProcessChannelClose(&gomavlib.EventChannelClose{Channel: &gomavlib.Channel{}})
@@ -618,11 +623,11 @@ func TestSiblingNonceIsNotCreated(t *testing.T) {
 	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
 	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now()}
 
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 5))
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 5), dirUplink)
 
-	_, upOK := m.lastNonce[nonceKey{deviceID: did, odd: true}]
+	_, upOK := m.lastNonce[nonceKey{deviceID: did, dir: dirUplink}]
 	require.True(t, upOK, "前提自检失败：上行水位没有建立，本格空转")
-	_, downOK := m.lastNonce[nonceKey{deviceID: did, odd: false}]
+	_, downOK := m.lastNonce[nonceKey{deviceID: did, dir: dirDownlink}]
 	require.False(t, downOK,
 		"只出现过上行的设备被伪造了一条下行水位 ⇒ 「从没出现过的方向」与「活跃方向」被混为一谈")
 }

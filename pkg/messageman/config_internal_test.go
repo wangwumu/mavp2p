@@ -11,6 +11,92 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testRoles 返回一对互不相同的入口端点，供需要走到 Initialize 的内部控制用例使用
+// （Initialize 只做指针校验与建表，不会真的监听端口）。
+func testRoles() (gomavlib.Endpoint, []gomavlib.Endpoint) {
+	return &gomavlib.EndpointTCPServer{Address: "127.0.0.1:1"},
+		[]gomavlib.Endpoint{&gomavlib.EndpointTCPServer{Address: "127.0.0.1:2"}}
+}
+
+// testNode 返回一个只用于 Initialize 交叉校验的 Node 外壳（不调用 Initialize，
+// 不监听任何端口）。端点必须是 testRoles 返回的**同一批对象**。
+func testNode(gcsEP gomavlib.Endpoint, vehEPs []gomavlib.Endpoint) *gomavlib.Node {
+	return &gomavlib.Node{Endpoints: append([]gomavlib.Endpoint{gcsEP}, vehEPs...)}
+}
+
+// TestInitializeRequiresEndpointRoles 钉住方向判据的配置前提：两个角色必须都有、
+// 且互不重叠。缺一个就只剩单端口，方向无从判定——那正是旧实现靠 counter 奇偶猜
+// 的处境，不允许它作为兼容路径复活。
+func TestInitializeRequiresEndpointRoles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+
+	gcs := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:1"}
+	veh := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:2"}
+	veh2 := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:3"}
+
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"缺 GCS 端点", Config{VehicleEndpoints: []gomavlib.Endpoint{veh}}},
+		{"缺载具端点", Config{GCSEndpoint: gcs}},
+		{"载具端点为 nil", Config{GCSEndpoint: gcs, VehicleEndpoints: []gomavlib.Endpoint{nil}}},
+		{"GCS 端点同时作为载具端点",
+			Config{GCSEndpoint: gcs, VehicleEndpoints: []gomavlib.Endpoint{gcs, veh2}}},
+	}
+	for _, c := range cases {
+		m := &Manager{Ctx: ctx, Wg: &wg, Config: c.cfg}
+		require.Error(t, m.Initialize(), c.name+"被接受 ⇒ 方向判定退化为猜测")
+	}
+
+	// 阴性对照：两个互不相同的端点必须能初始化，否则上面四格可以靠「Initialize 永远报错」假绿。
+	m := &Manager{Ctx: ctx, Wg: &wg, Node: testNode(gcs, []gomavlib.Endpoint{veh}),
+		Config: Config{GCSEndpoint: gcs, VehicleEndpoints: []gomavlib.Endpoint{veh}}}
+	require.NoError(t, m.Initialize(), "合法的双端点配置被拒绝 ⇒ 正常启动路径起不来")
+	cancel()
+	wg.Wait()
+}
+
+// TestInitializeCrossChecksNodeEndpoints 钉住「配置端点 = Node.Endpoints 里的同一批对象」。
+//
+// roleOf 用接口值相等认来源。装配时若把端点重新构造一遍（地址相同、对象不同），
+// 每个端口的每一帧都会判成 roleUnknown → 进程起得来、端口也监听，但一帧都不转发；
+// 现场只能从入口闸告警里看出「unknown endpoint role」。这类错误必须在启动期暴露。
+func TestInitializeCrossChecksNodeEndpoints(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+
+	gcs, veh := testRoles()
+	// 同地址、不同对象 —— 正是「照配置重新建一遍端点」的失败形态。
+	gcsTwin := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:1"}
+	extra := &gomavlib.EndpointTCPServer{Address: "127.0.0.1:9"}
+
+	cases := []struct {
+		name string
+		node *gomavlib.Node
+	}{
+		{"Node 未配置", nil},
+		{"Node.Endpoints 少了 GCS 端点", &gomavlib.Node{Endpoints: []gomavlib.Endpoint{veh[0]}}},
+		{"Node.Endpoints 里是另一个同地址对象",
+			&gomavlib.Node{Endpoints: []gomavlib.Endpoint{gcsTwin, veh[0]}}},
+		{"Node.Endpoints 多了一个无角色端点",
+			&gomavlib.Node{Endpoints: []gomavlib.Endpoint{gcs, veh[0], extra}}},
+	}
+	for _, c := range cases {
+		m := &Manager{Ctx: ctx, Wg: &wg, Node: c.node,
+			Config: Config{GCSEndpoint: gcs, VehicleEndpoints: veh}}
+		require.Error(t, m.Initialize(), c.name+"被接受 ⇒ 该端口的帧在运行期全部被丢弃")
+	}
+
+	// 阴性对照：同一批对象必须能初始化，否则上面四格可以靠「Initialize 永远报错」假绿。
+	m := &Manager{Ctx: ctx, Wg: &wg, Node: testNode(gcs, veh),
+		Config: Config{GCSEndpoint: gcs, VehicleEndpoints: veh}}
+	require.NoError(t, m.Initialize(), "同一批对象被拒绝 ⇒ 正常装配起不来")
+}
+
 // TestInitializeRejectsNegativeMaxQGCLinkedPX4 钉住入口校验。
 //
 // 改前：负上限在 processRegistration 里只当循环上界，是无害空转。2026-10-24 的诊断代码
@@ -26,12 +112,16 @@ func TestInitializeRejectsNegativeMaxQGCLinkedPX4(t *testing.T) {
 	defer cancel()
 	var wg sync.WaitGroup
 
-	zero := &Manager{Ctx: ctx, Wg: &wg}
+	gcsEP, vehEPs := testRoles()
+
+	zero := &Manager{Ctx: ctx, Wg: &wg, Node: testNode(gcsEP, vehEPs),
+		Config: Config{GCSEndpoint: gcsEP, VehicleEndpoints: vehEPs}}
 	require.NoError(t, zero.Initialize(), "零值配置被拒绝 ⇒ 默认启动路径起不来")
 	require.Equal(t, DefaultMaxQGCLinkedPX4, zero.maxQGCLinkedPX4(),
 		"零值没走默认上限 ⇒ 80005 的台数闸读到 0，任何登记都不建配对")
 
-	m := &Manager{Ctx: ctx, Wg: &wg, Config: Config{MaxQGCLinkedPX4: 16}}
+	m := &Manager{Ctx: ctx, Wg: &wg, Node: testNode(gcsEP, vehEPs),
+		Config: Config{MaxQGCLinkedPX4: 16, GCSEndpoint: gcsEP, VehicleEndpoints: vehEPs}}
 	require.NoError(t, m.Initialize(), "显式正值被拒绝 ⇒ 正常配置起不来")
 	cancel()
 	wg.Wait()

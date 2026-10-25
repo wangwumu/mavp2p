@@ -34,12 +34,13 @@ func newBareManager() *Manager {
 		regDiag:             map[*gomavlib.Channel]regDiagEntry{},
 		hbDiag:              map[uint32]time.Time{},
 		fanoutDiag:          map[uint32]time.Time{},
+		dropDiag:            map[*gomavlib.Channel]dropDiagEntry{},
 	}
 }
 
 // downlinkFrame 构造一帧 PX4 加密下行：帧头 deviceID = 发送方自身 did（§3.2.1 核心规则），
-// 偶数 counter（下行特征），msgID 取非心跳值——避免触发握手置位（§2.5）与心跳拦截判据，
-// 让本用例只测「PX4 普通下行对配对 lastSeen 的影响」这一件事。
+// counter 取偶数（照发送端约定，**不是**路由依据），msgID 取非心跳值——避免触发握手置位
+// （§2.5）与心跳拦截判据，让本用例只测「PX4 普通下行对配对 lastSeen 的影响」这一件事。
 func downlinkFrame(did uint32, counter uint64) *frame.V2Frame {
 	payload := make([]byte, 8+4)
 	binary.BigEndian.PutUint64(payload[:8], counter)
@@ -102,7 +103,7 @@ func TestPX4DownlinkKeepsPairButNotFanout(t *testing.T) {
 	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: staleSeen, qgcSeen: staleQGC}
 
 	// PX4 发来一帧加密下行。
-	m.processEncrypted(ch, did, downlinkFrame(did, 2))
+	m.processEncrypted(ch, did, downlinkFrame(did, 2), dirDownlink)
 
 	// ---- 第一格：PX4 下行**恢复**刷新配对 lastSeen（配对存活） ----
 	e, ok := m.pairs[pk]

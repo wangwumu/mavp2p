@@ -143,20 +143,24 @@ func generateEndpointConfs(endpoints []string) ([]gomavlib.Endpoint, error) {
 }
 
 var cli struct {
-	Version            bool `help:"Print version."`
-	Quiet              bool `short:"q" help:"Suppress info messages."`
-	Print              bool `help:"Print routed frames."`
-	PrintErrors        bool
-	ReadTimeout        time.Duration `help:"Timeout of read operations." default:"10s"`
-	WriteTimeout       time.Duration `help:"Timeout of write operations." default:"10s"`
-	IdleTimeout        time.Duration `help:"Disconnect idle connections after a timeout." default:"60s"`
-	HbDisable          bool          `help:"Disable heartbeats."`
-	HbVersion          int           `enum:"1,2" help:"Mavlink version of heartbeats." default:"1"`
+	Version      bool `help:"Print version."`
+	Quiet        bool `short:"q" help:"Suppress ALL log output, including warnings (not only info messages)."`
+	Print        bool `help:"Print routed frames."`
+	PrintErrors  bool
+	ReadTimeout  time.Duration `help:"TCP/UDP client 端点（tcpc/udpc）建连尝试的超时；不是每次读的超时（读截止由 --idle-timeout 承担）。serial 端点两者都不适用。" default:"10s"`
+	WriteTimeout time.Duration `help:"Timeout of write operations." default:"10s"`
+	IdleTimeout  time.Duration `help:"Disconnect idle connections after a timeout." default:"60s"`
+	UDPSendDelay time.Duration `help:"每个 UDP 数据报写出后，在该通道自己的写协程内等待的间隔，避免连续写包、给内核排空发送缓冲区留时间（0=关闭）。只作用于 datagram 端点，TCP 上不生效（仍会调用后立即返回）。注意 time.Sleep 会向上取整：请求 1µs 在 Linux 上实测约 30–40µs。" default:"1µs"`
+	// 本 fork 的 dialect 为空（全部 MessageRaw 透传），gomavlib 的节点心跳与自动
+	// stream-request 都以 errSkip 退出 ⇒ 下列 --hb-* 与 --streamreq-frequency 不生效；
+	// 保留这些 flag 只为与上游命令行兼容。
+	HbDisable          bool          `help:"（本 fork 不生效：空 dialect 不发射节点心跳）Disable heartbeats."`
+	HbVersion          int           `enum:"1,2" help:"（本 fork 不生效）Mavlink version of heartbeats." default:"1"`
 	HbSystemid         int           `default:"125"`
-	HbComponentid      int           `help:"Component ID of heartbeats." default:"191"`
-	HbPeriod           int           `help:"Period of heartbeats." default:"5"`
-	StreamreqDisable   bool
-	StreamreqFrequency int           `help:"Stream frequency to request." default:"4"`
+	HbComponentid      int           `help:"（本 fork 不生效）Component ID of heartbeats." default:"191"`
+	HbPeriod           int           `help:"（本 fork 不生效）Period of heartbeats." default:"5"`
+	StreamreqDisable   bool          `help:"关闭明文 RequestDataStream（msgID 66、payload<28B）的入口丢弃；默认两个端点都丢。注意它**不是**上游『自动请求』的开关——空 dialect 下自动请求本就不发生。"`
+	StreamreqFrequency int           `help:"（本 fork 不生效：空 dialect 不发起 stream request）Stream frequency to request." default:"4"`
 	Dump               bool          `help:"Dump telemetry to disk"`
 	DumpPath           string        `default:"dump/2006-01-02_15-04-05.tlog"`
 	DumpDuration       time.Duration `help:"Maximum duration of each dump segment" default:"1h"`
@@ -166,9 +170,10 @@ var cli struct {
 	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
 	FifoMgmtEndpoint   string        `help:"管理出口：写 FIFO 的同时用 UDP 把同一份报文镜像到该 ip:port。报文格式＝FIFO 那份（8B 时间戳+帧字节），是本仓库自定的约定；规范附录 A.1 的 MANAGEMENT_ENDPOINT 被标注为待定、不在协议范围。空=关闭，须同时开 --fifo-enable。"`
 	GCSDeviceIDMax     uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
-	MaxQGCLinkedPX4    int           `help:"单 QGC 最多关联 PX4 数量上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）" default:"16"`
+	MaxQGCLinkedPX4    int           `help:"单帧 80005 声明的台数上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）；不是该 QGC 的关联总数，超过需分片" default:"16"`
 	MapTTL             time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
 	StateIdleTimeout   time.Duration `help:"长期状态表空闲回收阈值：配对与防重放水位在加密流量静默超过该时长后回收（80005 周期登记不算流量）；诊断表各有自己的判据，见 messageman.prune" default:"10m"`
+	GCSEndpoint        string        `help:"地面站入口端点（QGC→载具的上行入口），写法与位置参数相同，例如 udps:0.0.0.0:5601。方向由入口端点决定：本端点进来的帧一律按上行，位置参数（载具端点）进来的帧一律按下行。必须配置，且不得与任何载具端点相同。"`
 	Endpoints          []string      `arg:"" optional:""`
 }
 
@@ -439,7 +444,9 @@ func newProgram(args []string) (*program, error) {
 					" in order to avoid conflicts when multiple ground stations are active."
 
 			case "endpoints":
-				desc := "Space-separated list of endpoints. At least one endpoint is required. " +
+				desc := "Space-separated list of **vehicle** endpoints (PX4 → mavp2p, downlink ingress). " +
+					"At least one is required. Ground stations connect to --gcs-endpoint instead; " +
+					"direction is decided by which endpoint a frame arrives on, never by counter parity. " +
 					"Possible endpoints types are:\n\n"
 				for k, etype := range endpointTypes {
 					desc += fmt.Sprintf("%s:%s (%s)\n\n", k, etype.args, etype.desc)
@@ -453,7 +460,7 @@ func newProgram(args []string) (*program, error) {
 				return "Path of the FIFO named pipe for filtered message output."
 
 			case "fifo-config":
-				return "Path to JSON config file containing an array of Mavlink message IDs to filter."
+				return "Path to YAML config file containing an array of Mavlink message IDs to filter."
 
 			case "fifo-fallback-path":
 				return "Path of the fallback file used when the FIFO is full or has no reader."
@@ -504,16 +511,41 @@ func newProgram(args []string) (*program, error) {
 	}
 
 	// print usage if no args are provided
-	// ‼️ 判据是「两个输入源都没给」而不是「命令行没给」：endpoints 允许只写在配置文件里，
-	// 那样 ARGV 就是光秃秃一个程序名，但进程该照常起来。只留 len(args) 的话，
-	// 配置文件驱动的部署（systemd unit 里不写任何端点）会被这里当成「用户啥也没给」拒掉。
+	// ‼️ 判据是「三个输入源都没给」：没有命令行位置参数、配置文件里也没有载具端点、
+	// 且没有 --gcs-endpoint。endpoints 允许只写在配置文件里，那样 ARGV 就是光秃秃
+	// 一个程序名，但进程该照常起来。只留 len(args) 的话，配置文件驱动的部署
+	// （systemd unit 里不写任何端点）会被这里当成「用户啥也没给」拒掉。
+	// 反过来，只给了 --gcs-endpoint 时不能落到这里：那是「缺载具端点」的配置错误，
+	// 下面的针对性报错比通用 Usage 更能说明该补什么。
 	//
 	// ‼️ 读的是**入参 args**，不是 os.Args：在 main() 里两者等价（传的就是 os.Args[1:]），
 	// 但只有读 args 才能在测试里走通这条分支 —— 读 os.Args 时进程是 `go test` 的 argv，
 	// `len(os.Args) > 1` 恒成立，分支恒不进、恒不可测。
-	if len(args) == 0 && len(cli.Endpoints) == 0 {
+	if len(args) == 0 && len(cli.Endpoints) == 0 && cli.GCSEndpoint == "" {
 		kongCtx.PrintUsage(false) //nolint:errcheck
 		os.Exit(1)
+	}
+
+	// 负值会被 gomavlib 的 `WriteDelay <= 0` 当作「关闭」，即 `-1s` 静默等于 `0`。
+	// 这与 MapTTL/StateIdleTimeout 的负值拒绝口径一致：配置写反要当场暴露。
+	if cli.UDPSendDelay < 0 {
+		return nil, fmt.Errorf("--udp-send-delay 不能为负（0=关闭）：%s", cli.UDPSendDelay)
+	}
+
+	// GCS 入口端点：方向由入口端点决定，故它是**必填**的。不提供「没配就退回单端口、
+	// 靠 counter 奇偶猜方向」的兼容路径 —— 那正是本次删掉的判据。
+	// 排在上面的 usage 分支**之后**：什么都没给时该打印用法，而不是报「缺 gcs-endpoint」。
+	if cli.GCSEndpoint == "" {
+		return nil, fmt.Errorf("--gcs-endpoint（或配置文件的 gcs_endpoint）是必填项：" +
+			"方向由入口端点决定，地面站与载具必须走不同端点")
+	}
+	// 同串即同端点：两个角色共用一个监听口会让 roleOf 无法区分来源，必须在建资源前拒绝。
+	// 这里只做**字符串**相等（写成两种拼法的同一地址不算命中），那种情况由随后
+	// node.Initialize 的 bind 失败拦下 —— 不会静默共用。
+	for _, e := range cli.Endpoints {
+		if e == cli.GCSEndpoint {
+			return nil, fmt.Errorf("--gcs-endpoint 与载具端点相同（%s）：地面站与载具必须走不同端点", e)
+		}
 	}
 
 	// `--fifo-mgmt-endpoint` 依附于 `--fifo-enable` 这个总开关，单独给出它是**静默
@@ -526,10 +558,23 @@ func newProgram(args []string) (*program, error) {
 				"请同时加 --fifo-enable，或去掉 --fifo-mgmt-endpoint")
 	}
 
+	if len(cli.Endpoints) == 0 {
+		// 只给了 --gcs-endpoint：方向判据缺了另一半，必须当场点名缺的是什么，
+		// 而不是让 generateEndpointConfs 报一句看不出该加哪个参数的
+		// 「at least one endpoint is required」。
+		return nil, fmt.Errorf("至少需要一个载具端点（位置参数，例如 udps:0.0.0.0:5600）：" +
+			"只有 --gcs-endpoint 时方向判据缺了载具这一半")
+	}
 	endpointConfs, err := generateEndpointConfs(cli.Endpoints)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("载具端点: %w", err)
 	}
+
+	gcsConfs, err := generateEndpointConfs([]string{cli.GCSEndpoint})
+	if err != nil {
+		return nil, fmt.Errorf("--gcs-endpoint: %w", err)
+	}
+	gcsEndpoint := gcsConfs[0]
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
@@ -541,7 +586,11 @@ func newProgram(args []string) (*program, error) {
 	dialect := generateDialect()
 
 	p.node = &gomavlib.Node{
-		Endpoints: endpointConfs,
+		// 两个角色都要在 Node 上真正监听：GCS 端点也是 gomavlib 的一个普通端点，
+		// 只是它会同时被交给 messageman 用作方向判据（同一批指针，见下方的注入）。
+		// 顺序无所谓，但**必须是同一批对象**：messageman.Initialize 会与这里交叉校验，
+		// 重建一份同地址的端点会让该端口的帧全部判成 roleUnknown。
+		Endpoints: append([]gomavlib.Endpoint{gcsEndpoint}, endpointConfs...),
 		Dialect:   dialect,
 		OutVersion: func() gomavlib.Version {
 			if cli.HbVersion == 2 {
@@ -558,6 +607,7 @@ func newProgram(args []string) (*program, error) {
 		ReadTimeout:            cli.ReadTimeout,
 		WriteTimeout:           cli.WriteTimeout,
 		IdleTimeout:            cli.IdleTimeout,
+		WriteDelay:             cli.UDPSendDelay,
 	}
 	err = p.node.Initialize()
 	if err != nil {
@@ -587,6 +637,10 @@ func newProgram(args []string) (*program, error) {
 			MaxQGCLinkedPX4:  cli.MaxQGCLinkedPX4,
 			MapTTL:           cli.MapTTL,
 			StateIdleTimeout: cli.StateIdleTimeout,
+			// 端点对象必须与 Node.Endpoints 里的**同一批指针**：roleOf 用指针比较
+			// 认通道来源，另建一份内容相同的端点会让所有帧都判成 roleUnknown。
+			GCSEndpoint:      gcsEndpoint,
+			VehicleEndpoints: endpointConfs,
 		},
 		Node: p.node,
 	}
@@ -646,14 +700,16 @@ func newProgram(args []string) (*program, error) {
 	}
 
 	log.Printf("mavp2p %s", version)
-	log.Printf("router started with %d %s",
+	log.Printf("router started with %d vehicle %s, GCS endpoint %s, udp-send-delay=%s",
 		len(endpointConfs),
 		func() string {
 			if len(endpointConfs) == 1 {
 				return "endpoint"
 			}
 			return "endpoints"
-		}())
+		}(),
+		cli.GCSEndpoint,
+		cli.UDPSendDelay)
 
 	p.wg.Add(1)
 	go p.run()
@@ -683,7 +739,10 @@ func (p *program) run() {
 				log.Printf("channel opened: %s", evt.Channel)
 
 			case *gomavlib.EventChannelClose:
-				log.Printf("channel closed: %s, %s", evt.Channel, evt.Error)
+				// 带上该通道累计的「队列满」丢帧数：5s 节流 WARN 里的是**打印那一刻**的
+				// 累计值，突发结束后不会再打第二条；通道关闭这一行是唯一能读到最终总数的地方。
+				log.Printf("channel closed: %s, %s (dropped %d frames while write queue was full)",
+					evt.Channel, evt.Error, evt.Channel.DroppedFrames())
 				p.messageMan.ProcessChannelClose(evt)
 
 			case *gomavlib.EventStreamRequested:
