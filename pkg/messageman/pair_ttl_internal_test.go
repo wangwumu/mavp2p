@@ -20,7 +20,7 @@ import (
 // 又慢又飘。直接调 prune() 把「TTL 到了 ⇒ 配对消失」这条因果钉得又准又快。
 
 // newBareManager 构造一个**不起后台 goroutine** 的 Manager，手工建齐 processEncrypted 与
-// prune 会碰到的五张表（在 nil map 上写入会 panic）。
+// prune 会碰到的全部八张表（在 nil map 上写入会 panic）。
 //
 // 刻意不走 Initialize()：那会起 run() 的 10s ticker goroutine，而本用例的判据不依赖它、
 // 也不该被它影响。
@@ -29,8 +29,11 @@ func newBareManager() *Manager {
 		px4Map:              map[uint32]*px4Entry{},
 		qgcOnline:           map[*gomavlib.Channel]*qgcEntry{},
 		pairs:               map[pairKey]*pairEntry{},
-		lastNonce:           map[nonceKey]uint64{},
+		lastNonce:           map[nonceKey]nonceEntry{},
 		emptyDownlinkLogged: map[uint32]time.Time{},
+		regDiag:             map[*gomavlib.Channel]regDiagEntry{},
+		hbDiag:              map[uint32]time.Time{},
+		fanoutDiag:          map[uint32]time.Time{},
 	}
 }
 
@@ -50,7 +53,9 @@ func downlinkFrame(did uint32, counter uint64) *frame.V2Frame {
 	}
 }
 
-// TestPX4DownlinkKeepsPairButNotFanout 钉住配对表两个时间戳的分工（2026-10-06 恢复）。
+// TestPX4DownlinkKeepsPairButNotFanout 钉住配对表前两个时间戳（lastSeen / qgcSeen）的分工
+// （2026-10-06 恢复）。第三个 lastTraffic 由 `state_idle_internal_test.go` 覆盖；本用例
+// 不调 prune，夹具也没有给它赋值（零值会被空闲闸无条件命中——加 prune 前先补上）。
 //
 // 演进经过，三段都要看，否则很容易把其中一段当成「正确实现」：
 //
@@ -83,7 +88,8 @@ func TestPX4DownlinkKeepsPairButNotFanout(t *testing.T) {
 	// 意义；到那一步，同不同指针已经无所谓。
 	ch := &gomavlib.Channel{}
 
-	// 两个时间戳刻意取不同龄期，让判据可以分开观测：
+	// lastSeen / qgcSeen 刻意取不同龄期，让判据可以分开观测（本用例不调 prune，
+	// 第三个 lastTraffic 不参与，见用例头注）：
 	//   - lastSeen 一小时前：远超 TTL，若 PX4 不刷它，prune 一定该删。
 	//   - qgcSeen 3×TTL 前：**已超 TTL**（扇出该被挡）但**未到 10×TTL 的兜底闸**（配对不该
 	//     被兜底清理）—— 取同一时刻的话，「配对还在」就分不清是 lastSeen 保住了它还是兜底
@@ -162,8 +168,13 @@ func TestRegistrationKeepsPairAlive(t *testing.T) {
 	otherKey := pairKey{qgcCh: ch, px4DeviceID: other}
 	// qgcSeen 与 lastSeen 取同一龄期：本用例只管「80005 登记能不能救活配对」，不区分两个
 	// 时间戳（那个分工由 TestPX4DownlinkKeepsPairButNotFanout 钉）。
-	m.pairs[aliveKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale}
-	m.pairs[otherKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale}
+	// ‼️ aliveKey 的 lastTraffic 取「刚刚」：自 2026-10-24 起，配对的**存活**除了两个
+	// TTL 闸还有一道空闲闸（80005 登记不续期）。本用例钉的是「登记刷新 lastSeen/qgcSeen」；
+	// 若 lastTraffic 也取陈旧，prune 会按新规则删掉它，断言就变成在验另一件事了。
+	m.pairs[aliveKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale, lastTraffic: time.Now()}
+	// otherKey 的 lastTraffic 同样取「刚刚」：本用例要它死在那道「未被声明 ⇒ 过期」的闸上，
+	// 而不是死在 2026-10-24 新增的真实流量闸上（零值会让那一闸无条件命中）。
+	m.pairs[otherKey] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: stale, lastTraffic: time.Now()}
 
 	// 80005 登记：num=2，声明 px4Did 与 fresh；other 刻意不出现。
 	payload := make([]byte, 1+2*4)

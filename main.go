@@ -168,6 +168,7 @@ var cli struct {
 	GCSDeviceIDMax     uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
 	MaxQGCLinkedPX4    int           `help:"单 QGC 最多关联 PX4 数量上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）" default:"16"`
 	MapTTL             time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
+	StateIdleTimeout   time.Duration `help:"长期状态表空闲回收阈值：配对与防重放水位在加密流量静默超过该时长后回收（80005 周期登记不算流量）；诊断表各有自己的判据，见 messageman.prune" default:"10m"`
 	Endpoints          []string      `arg:"" optional:""`
 }
 
@@ -585,6 +586,7 @@ func newProgram(args []string) (*program, error) {
 			GCSDeviceIDMax:   cli.GCSDeviceIDMax,
 			MaxQGCLinkedPX4:  cli.MaxQGCLinkedPX4,
 			MapTTL:           cli.MapTTL,
+			StateIdleTimeout: cli.StateIdleTimeout,
 		},
 		Node: p.node,
 	}

@@ -335,7 +335,7 @@ func TestProgramConfigEndpointsMalformedStillReported(t *testing.T) {
 // 它的逻辑，测不到它是否活在启动路径上（本仓正是踩过「立场被调用点的条件短路掉」）。
 //
 // 最后一格是阴性对照：形态正确的配置**必须能起来**。缺了它，本用例可以靠「见配置就
-// 报错」蒙混过关 —— 把 Validate 改成无条件 return error，前三格照样全绿。
+// 报错」蒙混过关 —— 把 Validate 改成无条件 return error，前四格照样全绿。
 func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 	// 先占一个真实空闲端口：阴性对照那一格会真的把程序起起来。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -365,8 +365,17 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 			wantSub: "必须写成带单位的字符串",
 		},
 		{
-			name: "阴性对照：两种正确写法都必须能起来",
-			yaml: "map_ttl: 30s\nmapTtl: 30s\n",
+			// 新增的状态空闲阈值同样是 duration：durationKeys 走反射自动收录它，
+			// 这里钉住「新加的 duration flag 也真的接上了那道闸」，而不是只测已知的 map_ttl。
+			name:    "新增的状态空闲阈值同样是 duration，裸数字同样要拒",
+			yaml:    "state_idle_timeout: 600\n",
+			wantSub: "必须写成带单位的字符串",
+		},
+		{
+			// 这一格同时是**接线**断言（见下方 Assert）：值取非默认，才能区分「真的接上了」
+			// 与「漏了注入、静默用默认值」。默认值是 10m，所以这里写 30m。
+			name: "阴性对照：两种正确写法都必须能起来，且值真的接到 Manager 上",
+			yaml: "map_ttl: 30s\nmapTtl: 30s\nstate_idle_timeout: 30m\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -375,15 +384,21 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 			swapConfigPaths(t, cfg)
 
 			p, err := newProgram(args)
-			// ‼️ 前三格在**正确实现**下 p 必为 nil（校验先于起监听），这个 defer 是空转。
+			// ‼️ 前四格在**正确实现**下 p 必为 nil（校验先于起监听），这个 defer 是空转。
 			// 但校验被架空的变异场景里，它们会真的把程序起起来并占住这个端口 —— 不关掉，
-			// 第四格的阴性对照就会以 `bind: address already in use` 红，那个红与判据无关，
+			// 第五格的阴性对照就会以 `bind: address already in use` 红，那个红与判据无关，
 			// 只会掩盖「阴性对照到底有没有判别力」这个信息。
 			if p != nil {
 				defer p.close()
 			}
 			if tc.wantSub == "" {
 				require.NoError(t, err, "形态正确的配置必须能起来：%s", tc.yaml)
+				// 接线断言：反射收录只保证「认得出、不报错」，不保证「接上了」——漏掉
+				// `StateIdleTimeout: cli.StateIdleTimeout` 那一行，程序照常启动、参数静默失效。
+				require.Equal(t, 30*time.Minute, p.messageMan.StateIdleTimeout,
+					"配置文件里的 state_idle_timeout 没接到 messageman.Manager ⇒ 参数形同虚设")
+				require.Equal(t, 30*time.Second, p.messageMan.MapTTL,
+					"配置文件里的 map_ttl 没接到 messageman.Manager")
 				return
 			}
 			require.Error(t, err, "配置写错必须在启动前拒绝，而不是静默退回默认值：%s", tc.yaml)

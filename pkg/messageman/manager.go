@@ -7,6 +7,7 @@ package messageman
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -26,6 +27,11 @@ const (
 	DefaultMaxQGCLinkedPX4 = 16
 	// 映射/在线/配对缓存 TTL（MAP_TTL）。
 	DefaultMapTTL = 60 * time.Second
+	// 长期状态表（配对/防重放水位/诊断表）的空闲回收阈值。
+	// 与 MAP_TTL 分工不同：MAP_TTL 管**路由存活**（秒级，靠 80005/PX4 心跳续命），
+	// 本值管**卫生**（分钟级），判据是「多久没有加密流量」。⚠️ 被 §2.5 拦下的 GCS 心跳
+	// **算**流量（发送端仍活跃，只是没被转发，见 pairEntry.lastTraffic）；80005 周期登记不算。
+	DefaultStateIdleTimeout = 10 * time.Minute
 
 	// 加密 payload block 最小长度 = counter(8) + deviceID(4) + tag(16)（§2.3）。
 	// msgID=0 且 payload 长度 < 该值是明文待命心跳，否则是加密帧。
@@ -45,6 +51,8 @@ type Config struct {
 	MaxQGCLinkedPX4 int
 	// 状态表 TTL（默认 DefaultMapTTL）。
 	MapTTL time.Duration
+	// 长期状态表空闲回收阈值（默认 DefaultStateIdleTimeout）。
+	StateIdleTimeout time.Duration
 }
 
 // px4Entry PX4 映射表项：deviceID → 当前可达 socketID（channel）。
@@ -59,7 +67,9 @@ type px4Entry struct {
 	handshaked bool
 }
 
-// qgcEntry QGC 在线表项：socketID（channel）→ 最近登记心跳时间。
+// qgcEntry QGC 在线表项：socketID（channel）→ 最近保活时间。
+// 两个来源都刷新：80005 登记心跳（周期 10s），以及该 QGC 的**加密上行**帧（§3.2.3
+// 保活约束）——后者让一个正在活跃会话里的 QGC 不会因为登记抖动被 MAP_TTL 误清。
 type qgcEntry struct {
 	lastSeen time.Time
 }
@@ -72,7 +82,7 @@ type pairKey struct {
 
 // pairEntry 配对表项：三元组 (QGC socketID, PX4 deviceID, PX4 socketID)。
 //
-// 两个时间戳分工不同，**别合并**（2026-10-06 改；完整演进时间线见
+// 三个时间戳分工不同，**别合并**（2026-10-06 改；完整演进时间线见
 // pair_ttl_internal_test.go 的 TestPX4DownlinkKeepsPairButNotFanout）：
 //
 //   - lastSeen：配对的**存活**。QGC 侧两源（80005 登记、加密上行心跳）与 **PX4 加密下行**
@@ -86,12 +96,30 @@ type pairEntry struct {
 	px4Ch    *gomavlib.Channel
 	lastSeen time.Time
 	qgcSeen  time.Time
+	// lastTraffic：本配对最近一次承载**加密流量**的时刻，只由加密上行/加密下行刷新。
+	// （准确说：上行分支的刷新点排在被 §2.5 拦下的 GCS 心跳**之前** ⇒ 被拦心跳也算流量。
+	//  这是有意的——QGC 还在 1 Hz 发心跳就说明这一端仍活跃，不该按空闲回收。）
+	// ‼️ 80005 登记**不刷新**它 —— 这正是「声明过、PX4 从未上线」的幽灵配对能只增不减的
+	// 原因：上面两个时间戳被登记周期性刷新（默认 10s；监控员视图对无帧设备另有 2s 定向重发），
+	// 两道 TTL 闸永不命中。存活判据归 lastSeen，可用性判据归 qgcSeen，本字段只管**回收**
+	// （prune 的 StateIdleTimeout 闸，默认 10 分钟）。
+	lastTraffic time.Time
 }
 
 // nonceKey 边缘防重放键：deviceID × 方向（上行奇数 / 下行偶数）。
 type nonceKey struct {
 	deviceID uint32
 	odd      bool
+}
+
+// nonceEntry 防重放水位 + 最近一次推进时间。时间戳只用于 prune 的空闲回收。
+//
+// 代价（2026-10-24 决策，接受）：水位被回收后，该方向的防重放窗口**重开**——不是
+// 「只放行一条」。首条被重放的帧会被接受并把水位写成它自己的 counter，此后任何更大的
+// 旧 counter 继续通过，直到该方向再次出现真实帧为止（协议 §2.5「重启边界」同类风险）。
+type nonceEntry struct {
+	counter  uint64
+	lastSeen time.Time
 }
 
 // FrameSink 接收「已通过会话路由全部过滤」的**下行帧副本**（FIFO / 管理出口）。
@@ -110,6 +138,39 @@ type FrameSink interface {
 	ProcessFrame(fr frame.Frame)
 }
 
+// regDiagEntry 是 80005 登记观测的节流状态。
+//
+// 签名变化才值得看，但监控员视图会逐台轮发单设备帧（1|[A] → 1|[B] → …），签名几乎每帧
+// 都变 ⇒ 再叠一道打印节流（kRegDiagLogInterval），避免每帧一条。
+type regDiagEntry struct {
+	sig  string
+	last time.Time
+}
+
+const kRegDiagLogInterval = 5 * time.Second
+
+// shouldLogRegDiag 决定本次 80005 诊断是否落日志，并在**决定落日志时**推进状态。
+//
+// 签名变了但距上次日志不足 kRegDiagLogInterval 时，本次返回 false 且**不更新 sig**：
+// 该签名只要窗口过后仍然出现就会补打（不会因为窗口而永久消失）。⚠️ 窗口内出现的
+// **其它**中间签名仍会被合并掉——这是节流的本意（监控员视图逐台轮发单设备帧，
+// 中间态没有排障价值），别把它读成"每个签名最终都会出现"。
+// 调用方须持 m.mu。
+func (m *Manager) shouldLogRegDiag(srcCh *gomavlib.Channel, sig string, now time.Time) bool {
+	if m.regDiag == nil {
+		m.regDiag = make(map[*gomavlib.Channel]regDiagEntry)
+	}
+	prev, ok := m.regDiag[srcCh]
+	if ok && prev.sig == sig {
+		return false
+	}
+	if ok && now.Sub(prev.last) < kRegDiagLogInterval {
+		return false
+	}
+	m.regDiag[srcCh] = regDiagEntry{sig: sig, last: now}
+	return true
+}
+
 // Manager 是有状态会话路由器。
 type Manager struct {
 	Ctx context.Context
@@ -121,12 +182,19 @@ type Manager struct {
 
 	mu        sync.Mutex
 	px4Map    map[uint32]*px4Entry            // PX4 映射表（deviceID → socketID）
-	qgcOnline map[*gomavlib.Channel]*qgcEntry // QGC 在线表（socketID → 心跳时间）
+	qgcOnline map[*gomavlib.Channel]*qgcEntry // QGC 在线表（socketID → 最近保活时间）
 	pairs     map[pairKey]*pairEntry          // 配对表（三元组）
-	lastNonce map[nonceKey]uint64             // 边缘防重放（deviceID × 方向）
+	lastNonce map[nonceKey]nonceEntry         // 边缘防重放（deviceID × 方向；时间戳仅供 prune）
 	// 空扇出告警节流：deviceID → 上次「PX4 加密下行但无配对 QGC」告警时间。
 	// PX4 持续下行而 QGC 配对已过期时会高频触发，需节流避免日志刷屏。
 	emptyDownlinkLogged map[uint32]time.Time
+	// ---- 路由可观测性（2026-10-24）----
+	// 三张表只读状态、不参与任何路由判定；分别回答排障时最常问的三句话：
+	// 「这条通道到底声明了谁」「待命心跳扇出给了几条通道」「这条下行为什么没投给某个配对」。
+	// 生命周期由 prune 统一回收（regDiag 跟 qgcOnline，另两张按 StateIdleTimeout）。
+	regDiag    map[*gomavlib.Channel]regDiagEntry // QGC 通道 → 上次**落日志**的签名 + 上次打印时刻
+	hbDiag     map[uint32]time.Time               // deviceID → 上次待命心跳扇出日志时间（5s 节流）
+	fanoutDiag map[uint32]time.Time               // deviceID → 上次下行扇出日志时间（10s 节流）
 }
 
 // gcsDeviceIDMax 返回配置的号段分界（0=默认）。
@@ -153,13 +221,66 @@ func (m *Manager) mapTTL() time.Duration {
 	return DefaultMapTTL
 }
 
+// stateIdleTimeout 返回长期状态表空闲回收阈值（0=默认）。
+func (m *Manager) stateIdleTimeout() time.Duration {
+	if m.StateIdleTimeout != 0 {
+		return m.StateIdleTimeout
+	}
+	return DefaultStateIdleTimeout
+}
+
+// validAircraftDeviceID 判定 80005 payload 里声明的 deviceID 是否是合法飞机 ID
+// （协议 §1.3 / §1.4）：必须落在 PX4 段且 bit24（incompatFlag bit0，签名位）为 0。
+//
+// 这不是路由判据的替代，而是**纵深防御**：QGC 侧解析入口已经过滤（2026-10-24），但两端
+// 的口径可能漂移（QGC 硬编码默认分界、本侧可配），且 mavp2p 是最后一道。
+// 没有这道闸时，这样的脏 ID 会建出 `px4Ch` 恒 nil、永不扇出的幽灵配对。
+// 本函数拦住来源，`StateIdleTimeout` 卫生闸负责回收历史残留。
+// 跳过它不影响「QGC 先登记、PX4 后上线」的重启恢复路径——那条路用的本来就是合法 ID。
+func (m *Manager) validAircraftDeviceID(d uint32) bool {
+	return d >= m.gcsDeviceIDMax() && d <= 0x7EFFFFFF && d&0x01000000 == 0
+}
+
+// touchSiblingNonce 给同 deviceID 的**另一方向**防重放水位续期（调用方须持有 m.mu）。
+// 只续期已存在的条目，不新建——从没见过的方向没有可续的水位。
+//
+// ‼️ 为什么需要：§2.5 拦截让「建链后 QGC 的 1 Hz 上行心跳」不再推进上行水位（被拦帧
+// 刻意不推进，见 processEncrypted 里的注释），而飞行中的加密下行一直推进下行水位
+// ⇒ 上行水位的 lastSeen 停在最后一条真实上行上，10 分钟后被 prune 回收。窗口一重开，
+// 一条重放的旧上行就能通过判据 —— 而这条链路其实一直活跃。
+// 口径：任一方向有真实转发 ⇒ 整条链路都活跃 ⇒ 两个方向一起续期。
+func (m *Manager) touchSiblingNonce(did uint32, odd bool, now time.Time) {
+	k := nonceKey{deviceID: did, odd: !odd}
+	if e, ok := m.lastNonce[k]; ok {
+		e.lastSeen = now
+		m.lastNonce[k] = e
+	}
+}
+
 // Initialize 初始化 Manager。
 func (m *Manager) Initialize() error {
+	// 负时长没有「用默认值」的合理解释（零值才是）：负值会让两道闸都恒真，每轮 prune
+	// 把整张表清空。在入口拒绝，而不是让它在运行期静默表现成「表永远为空」。
+	if m.MapTTL < 0 {
+		return fmt.Errorf("messageman: MapTTL must not be negative (got %s)", m.MapTTL)
+	}
+	if m.StateIdleTimeout < 0 {
+		return fmt.Errorf("messageman: StateIdleTimeout must not be negative (got %s)", m.StateIdleTimeout)
+	}
+	// 负上限在改前只是「循环空转」，2026-10-24 起 processRegistration 会用它作为
+	// make 的 cap ⇒ 必崩。入口拒绝；processRegistration 里另有一道截断兜底。
+	if m.MaxQGCLinkedPX4 < 0 {
+		return fmt.Errorf("messageman: MaxQGCLinkedPX4 must not be negative (got %d)", m.MaxQGCLinkedPX4)
+	}
+
 	m.px4Map = make(map[uint32]*px4Entry)
 	m.qgcOnline = make(map[*gomavlib.Channel]*qgcEntry)
 	m.pairs = make(map[pairKey]*pairEntry)
-	m.lastNonce = make(map[nonceKey]uint64)
+	m.lastNonce = make(map[nonceKey]nonceEntry)
 	m.emptyDownlinkLogged = make(map[uint32]time.Time)
+	m.regDiag = make(map[*gomavlib.Channel]regDiagEntry)
+	m.hbDiag = make(map[uint32]time.Time)
+	m.fanoutDiag = make(map[uint32]time.Time)
 
 	m.Wg.Add(1)
 	go m.run()
@@ -167,7 +288,8 @@ func (m *Manager) Initialize() error {
 	return nil
 }
 
-// run 周期清理超过 MAP_TTL 未活跃的状态。
+// run 周期清理（每 10s）：先按 MAP_TTL 清路由存活表，再按 StateIdleTimeout 做卫生回收，
+// 详见 prune。
 func (m *Manager) run() {
 	defer m.Wg.Done()
 
@@ -184,13 +306,26 @@ func (m *Manager) run() {
 	}
 }
 
-// prune 清除超过 MAP_TTL 未活跃的映射/在线/配对状态，并回收随之失去意义的空扇出告警
-// 节流记录（见函数末那段注释）。
-// lastNonce 不在此清理（每 deviceID×方向仅一条，规模有限；由 PX4 回待命心跳按
-// §2.5 软重置清除，见 processStandbyHeartbeat）。
+// prune 做两档清理：
+//
+//  1. 路由存活（MAP_TTL）：映射/在线/配对。这些表靠 80005 与 PX4 心跳续命，秒级。
+//  2. 卫生（StateIdleTimeout，默认 10 分钟）：配对、防重放水位、诊断表。
+//     各表的计时源**不同**，别用一句话概括：配对按 `lastTraffic`（加密上行/下行，见下）、
+//     水位按 `lastSeen`（加密帧，双方向互续）、`hbDiag`/`fanoutDiag` 按各自的日志写入时刻、
+//     `regDiag` 则不看时间而是看「通道是否还在 qgcOnline」。80005 周期登记不算流量。
+//
+// lastNonce 的空闲回收是 2026-10-24 新增的：改前只有「PX4 回待命」一条清路，长期运行的
+// 进程里水位表随历史 deviceID 数只增不减。代价按 2026-10-24 决策接受：设备空闲超过阈值
+// 后该方向的防重放窗口**重开**，直到再次出现真实帧为止（不是「只放行一条」，见 nonceEntry
+// 的注释；协议 §2.5「重启边界」同类残余风险）。因此两个方向的水位在任方向有真实帧时互相
+// 续期（见 touchSiblingNonce），避免「下行活跃、上行水位因 §2.5 拦截而变旧」的链路被误回收。
 func (m *Manager) prune() {
 	now := time.Now()
 	ttl := m.mapTTL()
+	idle := m.stateIdleTimeout()
+
+	// 本轮卫生回收的计数（只为打一行汇总，避免逐条刷屏；配对回收另有逐条日志）。
+	var nNonces, nRegDiag, nHb, nFanout int
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -210,6 +345,20 @@ func (m *Manager) prune() {
 	for k, e := range m.pairs {
 		if now.Sub(e.lastSeen) >= ttl {
 			log.Printf("pair expired: QGC %s <-> PX4 deviceID=%d", k.qgcCh, k.px4DeviceID)
+			delete(m.pairs, k)
+			continue
+		}
+		// 卫生闸（2026-10-24）：真实流量静默超过 StateIdleTimeout（默认 10 分钟）⇒ 回收。
+		// ‼️ 判据必须是 lastTraffic。上面两道闸读的 lastSeen / qgcSeen 都被 80005（默认 10s，
+		// 监控员视图对无帧设备另有 2s 定向重发）刷新。改前：「QGC 声明过、PX4 从未上线」的
+		// 幽灵配对（px4Ch 恒 nil、永不扇出）两道闸都命中不了，只能等 QGC 通道关闭 ——
+		// 这正是配对表只增不减的成因，本闸就是为它加的。
+		if now.Sub(e.lastTraffic) >= idle {
+			// 逐条带 deviceID：回收后到下一次 80005 登记之间的**所有**下行帧都会被丢
+			// （下行分支不建配对；站点视图约 10s、监控员视图约 2s 后恢复）。没有这条日志，
+			// 运维无法把一次「偶发丢帧」对上回收事件。
+			log.Printf("pair idle-purged: QGC %s <-> PX4 deviceID=%d idle=%s",
+				k.qgcCh, k.px4DeviceID, now.Sub(e.lastTraffic).Round(time.Second))
 			delete(m.pairs, k)
 			continue
 		}
@@ -236,6 +385,47 @@ func (m *Manager) prune() {
 		if _, ok := m.px4Map[did]; !ok {
 			delete(m.emptyDownlinkLogged, did)
 		}
+	}
+
+	// ---- 卫生回收（StateIdleTimeout）----
+	// 防重放水位：长期没有真实帧的设备，其水位没有保留价值（代价：窗口重开到下一条真实帧，
+	// 见 nonceEntry）。时间戳由 touchSiblingNonce 按 deviceID 双方向一并续期。
+	for k, e := range m.lastNonce {
+		if now.Sub(e.lastSeen) >= idle {
+			// 逐条带 deviceID + 方向：回收意味着该方向防重放窗口**重开**（见 nonceEntry），
+			// 之后可能出现一条被放行的重复帧。没有这条日志，运维无法把「偶发重复」对上回收事件。
+			log.Printf("nonce idle-purged: deviceID=%d direction=%s counter=%d idle=%s",
+				k.deviceID, dirName(k.odd), e.counter, now.Sub(e.lastSeen).Round(time.Second))
+			delete(m.lastNonce, k)
+			nNonces++
+		}
+	}
+	// regDiag 的键是 QGC 通道，没有自己的时间戳：判据取「该通道是否还在 QGC 在线表里」
+	// （不按 idle 计时：一个通道只要还在线，它的登记签名就仍有比较价值）。
+	// ‼️ 必须排在上面 qgcOnline 清理**之后** —— 顺序反了，本轮刚该消失的通道此刻还在
+	// qgcOnline 里，它的签名会漏掉，而 map 键持有已死的 channel 指针，同样只增不减。
+	for ch := range m.regDiag {
+		if _, ok := m.qgcOnline[ch]; !ok {
+			delete(m.regDiag, ch)
+			nRegDiag++
+		}
+	}
+	// 两张日志节流表：值本身就是上次写入时刻，直接按时间戳回收。
+	for did, t := range m.hbDiag {
+		if now.Sub(t) >= idle {
+			delete(m.hbDiag, did)
+			nHb++
+		}
+	}
+	for did, t := range m.fanoutDiag {
+		if now.Sub(t) >= idle {
+			delete(m.fanoutDiag, did)
+			nFanout++
+		}
+	}
+	if nNonces+nRegDiag+nHb+nFanout > 0 {
+		log.Printf("state purge: nonces=%d regDiag=%d hbDiag=%d fanoutDiag=%d",
+			nNonces, nRegDiag, nHb, nFanout)
 	}
 }
 
@@ -294,6 +484,23 @@ func (m *Manager) ProcessFrame(evt *gomavlib.EventFrame) {
 	}
 }
 
+// registrationDeviceIDAt 读 80005 payload 里第 i 个 deviceID（i 从 0 起）。
+//
+// 超出 payload 的字节按 0 计：`mavlink_msg_qgc_registration_pack` 把 payload 零初始化后
+// 按 len 发送，**尾部零字节会被裁掉**——一帧一台时，被裁的就是那唯一一台 ID 的低字节
+// （如 10000384 = 0x00989800 ⇒ len 只有 4）。按 `1+i*4 : 5+i*4` 直接切片会在 len 不足时
+// panic；按 `(len-1)/4` 截断台数则会把合法登记读成「0 台」⇒ 该机永远建不出配对。
+func registrationDeviceIDAt(payload []byte, i int) uint32 {
+	var b [4]byte
+	off := 1 + i*4
+	for j := range b {
+		if off+j < len(payload) {
+			b[j] = payload[off+j]
+		}
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
+
 // processRegistration 处理 80005 明文登记/保活心跳（§3.2.1 QGC 在线表 + 配对表）。
 func (m *Manager) processRegistration(srcCh *gomavlib.Channel, did uint32, msg message.Message) {
 	// 帧头 deviceID 必须在 GCS 段（§2.2：QGC 登记心跳用 GCS 段固定值）
@@ -312,8 +519,35 @@ func (m *Manager) processRegistration(srcCh *gomavlib.Channel, did uint32, msg m
 	if num > m.maxQGCLinkedPX4() {
 		num = m.maxQGCLinkedPX4()
 	}
-	if len(payload) < 1+num*4 {
-		num = (len(payload) - 1) / 4 // 防畸形：按实际长度截断
+	// 兜底（Initialize 已拒绝负配置）：负值在这里只该是「0 条声明」。少了这一行，
+	// 下面的 `make([]uint32, 0, num)` 会 panic 打挂整个进程——配置写错不该有这种杀伤力。
+	if num < 0 {
+		num = 0
+	}
+	// ⚠️ 不按帧长截断台数：尾部零字节本来就是打包时被裁掉的（见 registrationDeviceIDAt）。
+	// 声明 N 台却只有前几个字节，既可能是「末尾几台全零、整段被裁成尾零」，也可能是畸形帧；
+	// 两种都按声明解码，补出来的全零 ID 由 validAircraftDeviceID 挡掉（不会建出幽灵配对）。
+	// num 已被 maxQGCLinkedPX4 限幅，不会因为一个巨大的声明值把循环撑爆。
+
+	// 诊断：先把 payload 里的声明值摊开（不受后续 pair 是否已存在影响）。
+	// 同时做纵深防御的合法性判定：非法 ID 不进配对表（否则是永不扇出的幽灵配对）。
+	// declaredIDs 保留**全部**声明值（与原诊断口径一致），invalidIDs 单列，进签名。
+	declaredIDs := make([]uint32, 0, num)
+	invalidIDs := make([]uint32, 0)
+	for i := 0; i < num; i++ {
+		d := registrationDeviceIDAt(payload, i)
+		declaredIDs = append(declaredIDs, d)
+		if !m.validAircraftDeviceID(d) {
+			invalidIDs = append(invalidIDs, d)
+		}
+	}
+
+	// 非法 ID 单独成行，不并入下面的签名节流：一帧一台时逐帧签名几乎每帧都变，
+	// 节流只保留「与上次已落日志签名不同、且窗口已过」的那一帧 ⇒ 一轮里的第 3 台起
+	// 可能永远不落日志，现场只看到「没有配对」，对不到「ID 被拒」这个根因。
+	// 频率上限＝登记频率（每台每 10s 一次），异常路径值得逐条可见。
+	for _, d := range invalidIDs {
+		log.Printf("80005 rejected invalid deviceID=%d from %s (payloadLen=%d)", d, srcCh, len(payload))
 	}
 
 	now := time.Now()
@@ -321,18 +555,40 @@ func (m *Manager) processRegistration(srcCh *gomavlib.Channel, did uint32, msg m
 	// 核心规则：按来源方（QGC）刷新 QGC 在线表（键 = 来源 socketID）
 	m.qgcOnline[srcCh] = &qgcEntry{lastSeen: now}
 
+	// 观测（2026-10-24）：签名（num|declaredIDs|invalidIDs）变化时打一行，并叠加打印节流。
+	// ⚠️ 签名是**逐帧**比较，不是按集合归一化：监控员视图的 2s 定向重发会逐台轮发单设备帧
+	// （1|[A] → 1|[B] → …），签名几乎每帧都变 ⇒ 只看签名会每帧一条；5s 节流下仍能看清
+	// 「某一轮声明了谁」，代价是窗口内的中间签名会被合并。
+	{
+		sig := fmt.Sprintf("%d|%v|%v", num, declaredIDs, invalidIDs)
+		if m.shouldLogRegDiag(srcCh, sig, now) {
+			log.Printf("80005 diag: %p declared=%d parsed=%d payloadLen=%d ids=%v rejected=%v",
+				srcCh, int(payload[0]), num, len(payload), declaredIDs, invalidIDs)
+		}
+	}
+
 	// 按 payload 的 PX4 deviceID 集合刷新配对表 QGC 侧（§3.2.4.1 重启恢复/重定位）
 	for i := 0; i < num; i++ {
-		d := binary.BigEndian.Uint32(payload[1+i*4 : 5+i*4])
+		d := registrationDeviceIDAt(payload, i)
+		if !m.validAircraftDeviceID(d) {
+			// 已在上面的 invalidIDs 里进过诊断；这里只跳过建表（纵深防御，理由见
+			// validAircraftDeviceID 的注释）。
+			continue
+		}
 		k := pairKey{qgcCh: srcCh, px4DeviceID: d}
 		e, ok := m.pairs[k]
 		if !ok {
-			e = &pairEntry{lastSeen: now, qgcSeen: now}
+			// lastTraffic 初值取登记时刻：从「第一次出现」开始计 StateIdleTimeout（默认 10 分钟），
+			// 此后只有加密帧能续期（见 pairEntry 的注释）。
+			e = &pairEntry{lastSeen: now, qgcSeen: now, lastTraffic: now}
 			m.pairs[k] = e
 			log.Printf("QGC %s registered: linked PX4 deviceID=%d", srcCh, d)
 		} else {
-			// 两个时间戳都刷：80005 是 QGC 侧**唯一**周期性的声明源，既是配对的存活源，
-			// 也是唯一能让 qgcSeen 变新鲜的东西（加密上行是 1Hz，但只在有上行帧时才来）。
+			// lastSeen / qgcSeen 都刷：80005 是 QGC 侧**唯一**周期性的声明源，既是配对的
+			// 存活源，也是唯一能让 qgcSeen 变新鲜的东西（加密上行是 1Hz，但只在有上行帧
+			// 时才来）。登记周期：默认 10s；监控员视图对无帧设备另有 2s 定向重发。
+			// ‼️ 刻意**不刷** lastTraffic：登记是声明、不是流量。刷了的话，一个从未上线的
+			//    deviceID 会靠周期登记永远年轻，StateIdleTimeout 回收闸形同虚设。
 			e.lastSeen = now
 			e.qgcSeen = now
 		}
@@ -375,9 +631,11 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 	// 若无条件清除，开机待命期间每个心跳周期（PX4 待命心跳默认 20Hz，§2.5）都会清掉
 	// QGC 刚经 80005 登记的配对，使其无法存活到 PX4 切入加密下行。
 	// 水位缺失 ≠ 未经历过会话：上行水位由「上行且 px4Map 命中」写入、下行水位由「下行且
-	// px4Map 命中」写入，二者独立。水位缺失的全部情形只有两处——从未建链，或握手期第一条
-	// 加密上行已被路由、PX4 第一条加密下行尚未到达；后者的配对正是刚经 80005 建立、必须
-	// 保留到切入加密下行的那一条，故此时不清同样正确。⇒ 本判据对「该不该清」是充要的。
+	// px4Map 命中」写入，二者独立。水位缺失的情形有三处——从未建链；握手期第一条加密上行
+	// 已被路由、PX4 第一条加密下行尚未到达；以及自 2026-10-24 起的**空闲回收**
+	// （`StateIdleTimeout`，水位静默超阈值被 prune 删掉）。前两处「不清」都正确：后者的
+	// 配对正是刚经 80005 建立、必须保留到切入加密下行的那一条。第三处「不清」代价有限：
+	// 能走到空闲回收就说明该配对的 lastTraffic 也同样陈旧，下一次 prune 会按空闲闸清掉它。
 	// 前提：PX4 不允许崩溃重启（PX4 侧状态连续，不会凭空退回待命）；mavp2p/QGC 重启则
 	// 两侧水位一并清空，也不落入该窗口。
 	nkUp := nonceKey{deviceID: did, odd: true}
@@ -404,6 +662,15 @@ func (m *Manager) processStandbyHeartbeat(srcCh *gomavlib.Channel, did uint32, f
 	qgcs := make([]*gomavlib.Channel, 0, len(m.qgcOnline))
 	for ch := range m.qgcOnline {
 		qgcs = append(qgcs, ch)
+	}
+	// 观测（2026-10-24）：明文待命心跳按 qgcOnline 全表扇出，与 pairs 无关。
+	// 5 s 节流（与心跳频率无关：PX4 当前发 2 Hz，但节流按时间窗而不是按帧计数）。
+	if m.hbDiag == nil {
+		m.hbDiag = make(map[uint32]time.Time)
+	}
+	if last, ok := m.hbDiag[did]; !ok || now.Sub(last) >= 5*time.Second {
+		m.hbDiag[did] = now
+		log.Printf("standby heartbeat diag: deviceID=%d fanout=%d qgcOnline=%d", did, len(qgcs), len(m.qgcOnline))
 	}
 	m.mu.Unlock()
 
@@ -449,7 +716,7 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	var nk *nonceKey
 	if counter != 0 {
 		k := nonceKey{deviceID: did, odd: odd}
-		if last, ok := m.lastNonce[k]; ok && counter <= last {
+		if last, ok := m.lastNonce[k]; ok && counter <= last.counter {
 			m.mu.Unlock()
 			log.Printf("dropped replayed frame deviceID=%d %s counter=%d from %s", did, dirName(odd), counter, srcCh)
 			return
@@ -464,12 +731,13 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 	// 是发送方自身（§3.2.1 核心规则）；不得仅凭号段判方向，也不得把「来源 == PX4 映射
 	// socketID」作为判下行的前提（漂移时可能不等）。
 	if _, isQGC := m.qgcOnline[srcCh]; isQGC {
+		now := time.Now()
 		// ---- 上行（QGC → PX4）：帧头 deviceID = 目标 PX4 的 D（§3.2.3）----
 		// 活跃加密上行维持 QGC 在线身份（§3.2.3 保活约束：QGC 在线表靠登记/保活维护，
 		// 避免活跃会话被 MAP_TTL 误清理后再落入非 QGC 分支）；先刷新，使「上行→未知
 		// PX4」路径也维持在线身份
 		if qe, ok := m.qgcOnline[srcCh]; ok {
-			qe.lastSeen = time.Now()
+			qe.lastSeen = now
 		}
 		px4, ok := m.px4Map[did]
 		if !ok {
@@ -484,12 +752,13 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		pk := pairKey{qgcCh: srcCh, px4DeviceID: did}
 		e, ok := m.pairs[pk]
 		if !ok {
-			m.pairs[pk] = &pairEntry{px4Ch: px4.channel, lastSeen: time.Now(), qgcSeen: time.Now()}
+			m.pairs[pk] = &pairEntry{px4Ch: px4.channel, lastSeen: now, qgcSeen: now, lastTraffic: now}
 			log.Printf("link established: QGC %s <-> PX4 deviceID=%d (%s)", srcCh, did, px4.channel)
 		} else {
 			e.px4Ch = px4.channel
-			e.lastSeen = time.Now()
-			e.qgcSeen = time.Now()
+			e.lastSeen = now
+			e.qgcSeen = now
+			e.lastTraffic = now // 真实上行 ⇒ 本配对确实承载了转发
 		}
 		// 加密心跳拦截（§2.5）：该 PX4 已握手（曾发出加密心跳 ⇒ 加密链路已建成）后，
 		// 不再把 QGC 的加密 GCS 心跳转给它。本位置受两条约束夹定，都不可挪：必须在
@@ -502,7 +771,8 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 			return
 		}
 		if nk != nil {
-			m.lastNonce[*nk] = counter
+			m.lastNonce[*nk] = nonceEntry{counter: counter, lastSeen: now}
+			m.touchSiblingNonce(did, odd, now)
 		}
 		target := px4.channel // 锁内快照，锁外转发避免锁后读竞争
 		m.mu.Unlock()
@@ -578,12 +848,44 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 		if k.px4DeviceID == did {
 			e.px4Ch = srcCh
 			e.lastSeen = now
+			// 真实下行 ⇒ 本配对承载了转发。宽松口径：该 deviceID 名下所有配对一并续期
+			// （投给谁仍由 qgcSeen 单独决定），10 分钟闸只做卫生、不做投递判定。
+			e.lastTraffic = now
 		}
 	}
 	// 下行路由：只发给配对的任务 QGC（不扇出），§3.2.2 步骤 4
 	qgcs := m.fanoutTargets(did, srcCh, now)
+	// 观测（2026-10-24）：10 s 节流，把该 deviceID 名下每个配对的扇出判据拆开打。
+	// 目的：区分「配对不存在」「px4Ch 不匹配」「qgcSeen 过期」三种被排除的原因。
+	if m.fanoutDiag == nil {
+		m.fanoutDiag = make(map[uint32]time.Time)
+	}
+	if last, ok := m.fanoutDiag[did]; !ok || now.Sub(last) >= 10*time.Second {
+		m.fanoutDiag[did] = now
+		type pairDiag struct {
+			qgc      string
+			px4Match bool
+			qgcAgeMs int64
+		}
+		ds := make([]pairDiag, 0, len(m.pairs))
+		for k, e := range m.pairs {
+			if k.px4DeviceID != did {
+				continue
+			}
+			ds = append(ds, pairDiag{
+				qgc:      fmt.Sprintf("%p", k.qgcCh),
+				px4Match: e.px4Ch == srcCh,
+				qgcAgeMs: now.Sub(e.qgcSeen).Milliseconds(),
+			})
+		}
+		log.Printf("downlink diag: deviceID=%d src=%p pairs=%d fanout=%d ttl=%s detail=%v",
+			did, srcCh, len(ds), len(qgcs), m.mapTTL(), ds)
+	}
 	if nk != nil {
-		m.lastNonce[*nk] = counter
+		m.lastNonce[*nk] = nonceEntry{counter: counter, lastSeen: now}
+		// 下行活跃 ⇒ 上行水位一并续期：活跃会话里 QGC 的上行心跳被 §2.5 拦截、不推进
+		// 上行水位，只靠上行刷新会让它在 10 分钟后被回收（见 touchSiblingNonce 的注释）。
+		m.touchSiblingNonce(did, odd, now)
 	}
 	// 空扇出：PX4 加密下行但无配对任务 QGC（典型：QGC 配对被 MAP_TTL 剪除而 PX4 仍
 	// 持续下行）。节流打日志（每 deviceID 10s 一次），避免高频遥测下刷屏。
@@ -625,6 +927,9 @@ func (m *Manager) processEncrypted(srcCh *gomavlib.Channel, did uint32, fr frame
 //     时被 PX4 下行持续刷新）。两个判据刻意**不**互补，中间那 9 个 TTL 就是「配对活着但不投喂」。
 //     ‼️ **别因为「prune 已经管了」就删掉这一道**：配对的存活由 `lastSeen` 决定，而它被 PX4 刷着
 //     ⇒ 删掉本闸，扇出条件就退化成「配对存在」，签出方重新无限期收帧（2026-10-05 修的就是这个）。
+//     ⚠️「中间 9 个 TTL」这一窗口**不受** `StateIdleTimeout` 影响：PX4 的每一帧下行都会把
+//     该 deviceID 名下所有配对的 `lastTraffic` 一并刷新（见下行分支），空闲闸在这个窗口里
+//     根本不会命中。窗口的上界仍由 prune 的 `qgcSeen ≥ 10×TTL` 兜底闸决定。
 func (m *Manager) fanoutTargets(did uint32, srcCh *gomavlib.Channel, now time.Time) []*gomavlib.Channel {
 	ttl := m.mapTTL()
 	out := make([]*gomavlib.Channel, 0)
@@ -639,6 +944,8 @@ func (m *Manager) fanoutTargets(did uint32, srcCh *gomavlib.Channel, now time.Ti
 // ProcessChannelClose 处理 EventChannelClose：清理与该 channel 关联的全部状态。
 // 注意：此处不清 lastNonce——PX4 断线重连（NAT 重建）counter 连续，清掉会重开防重放
 // 窗口；PX4 整机重启会发回待命心跳，由 processStandbyHeartbeat 按 §2.5 清 lastNonce。
+// 长时间没有真实流量的水位另有 prune 的 StateIdleTimeout 闸（默认 10 分钟）负责回收，
+// 两条清路分工不同：这里按**通道**、那里按**空闲时长**。
 func (m *Manager) ProcessChannelClose(evt *gomavlib.EventChannelClose) {
 	ch := evt.Channel
 
@@ -647,6 +954,7 @@ func (m *Manager) ProcessChannelClose(evt *gomavlib.EventChannelClose) {
 
 	if _, ok := m.qgcOnline[ch]; ok {
 		delete(m.qgcOnline, ch)
+		delete(m.regDiag, ch) // 诊断表同样按键持有 channel，随之回收
 		log.Printf("QGC gone: %s", ch)
 	}
 	for did, e := range m.px4Map {
