@@ -1,0 +1,61 @@
+# github.com/alecthomas/kong v1.16.1
+## explicit; go 1.20
+github.com/alecthomas/kong
+# github.com/bluenviron/gomavlib/v4 v4.0.0 => ../gomavlib
+## explicit; go 1.25.0
+github.com/bluenviron/gomavlib/v4
+github.com/bluenviron/gomavlib/v4/pkg/dialect
+github.com/bluenviron/gomavlib/v4/pkg/dialects/ardupilotmega
+github.com/bluenviron/gomavlib/v4/pkg/dialects/common
+github.com/bluenviron/gomavlib/v4/pkg/dialects/csairlink
+github.com/bluenviron/gomavlib/v4/pkg/dialects/cubepilot
+github.com/bluenviron/gomavlib/v4/pkg/dialects/icarous
+github.com/bluenviron/gomavlib/v4/pkg/dialects/loweheiser
+github.com/bluenviron/gomavlib/v4/pkg/dialects/minimal
+github.com/bluenviron/gomavlib/v4/pkg/dialects/standard
+github.com/bluenviron/gomavlib/v4/pkg/dialects/uavionix
+github.com/bluenviron/gomavlib/v4/pkg/frame
+github.com/bluenviron/gomavlib/v4/pkg/message
+github.com/bluenviron/gomavlib/v4/pkg/streamwriter
+github.com/bluenviron/gomavlib/v4/pkg/timednetconn
+github.com/bluenviron/gomavlib/v4/pkg/tlog
+github.com/bluenviron/gomavlib/v4/pkg/x25
+# github.com/davecgh/go-spew v1.1.1
+## explicit
+github.com/davecgh/go-spew/spew
+# github.com/pion/logging v0.2.2
+## explicit; go 1.12
+github.com/pion/logging
+# github.com/pion/transport/v2 v2.2.10
+## explicit; go 1.12
+github.com/pion/transport/v2/deadline
+github.com/pion/transport/v2/packetio
+github.com/pion/transport/v2/udp
+# github.com/pmezard/go-difflib v1.0.0
+## explicit
+github.com/pmezard/go-difflib/difflib
+# github.com/stretchr/testify v1.11.1
+## explicit; go 1.17
+github.com/stretchr/testify/assert
+github.com/stretchr/testify/assert/yaml
+github.com/stretchr/testify/require
+# go.bug.st/serial v1.8.0
+## explicit; go 1.25.0
+go.bug.st/serial
+go.bug.st/serial/unixutils
+# golang.org/x/net v0.55.0
+## explicit; go 1.25.0
+golang.org/x/net/bpf
+golang.org/x/net/internal/iana
+golang.org/x/net/internal/socket
+golang.org/x/net/ipv4
+golang.org/x/net/ipv6
+# golang.org/x/sys v0.45.0
+## explicit; go 1.25.0
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+golang.org/x/sys/windows/registry
+# gopkg.in/yaml.v3 v3.0.1
+## explicit
+gopkg.in/yaml.v3
+# github.com/bluenviron/gomavlib/v4 => ../gomavlib
