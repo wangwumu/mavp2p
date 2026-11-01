@@ -3,7 +3,9 @@ package messageman_test
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -76,6 +78,9 @@ func newServerN(t *testing.T, numVehicles int) (*gomavlib.Node, *messageman.Mana
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
+	// P5 起建链期下行必须过验签。本包的路由用例只关心路由，不关心密码学 ⇒ 一律放行。
+	verifyPath, stopOracle := newFakeOracle(t)
+
 	m := &messageman.Manager{
 		Ctx: ctx,
 		Wg:  &wg,
@@ -84,6 +89,8 @@ func newServerN(t *testing.T, numVehicles int) (*gomavlib.Node, *messageman.Mana
 			// 端点对象与 Node.Endpoints 里的是**同一批指针**（roleOf 用指针比较认来源）。
 			GCSEndpoint:      gcsEP,
 			VehicleEndpoints: vehicleEPs,
+			VerifySocket:     verifyPath,
+			VerifyTimeout:    time.Second,
 		},
 		Node: node,
 	}
@@ -94,7 +101,59 @@ func newServerN(t *testing.T, numVehicles int) (*gomavlib.Node, *messageman.Mana
 		cancel()
 		wg.Wait()
 		node.Close()
+		stopOracle()
 	}
+}
+
+// newFakeOracle 起一个最小的 Unix socket 验签服务：读 12B 请求头 + payload，
+// 原样回 reqID 与状态 0（通过）。用例只关心路由，不关心密码学。
+func newFakeOracle(t *testing.T) (string, func()) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "verify.sock")
+	ln, err := net.Listen("unix", path)
+	require.NoError(t, err)
+
+	var (
+		once sync.Once
+		wg   sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer conn.Close() //nolint:errcheck
+				hdr := make([]byte, 12)
+				if _, err := io.ReadFull(conn, hdr); err != nil {
+					return
+				}
+				payload := make([]byte, int(binary.BigEndian.Uint16(hdr[10:12])))
+				if _, err := io.ReadFull(conn, payload); err != nil {
+					return
+				}
+				out := make([]byte, 5)
+				copy(out[:4], hdr[1:5]) // reqID
+				out[4] = 0              // 通过
+				_, _ = conn.Write(out)
+			}()
+		}
+	}()
+
+	stop := func() {
+		once.Do(func() {
+			ln.Close() //nolint:errcheck
+			wg.Wait()
+		})
+	}
+	t.Cleanup(stop)
+	return path, stop
 }
 
 // freePort 探一个当前空闲的 TCP 端口（探完即关）。同包用例串行，竞争窗口可接受；
@@ -197,8 +256,8 @@ func expectNoFrame(t *testing.T, p *peer, timeout time.Duration) {
 	for {
 		select {
 		case evt := <-p.node.Events():
-			if _, ok := evt.(*gomavlib.EventFrame); ok {
-				t.Fatalf("unexpected frame received")
+			if ef, ok := evt.(*gomavlib.EventFrame); ok {
+				t.Fatalf("unexpected frame received: msgID=%d", ef.Frame.GetMessage().GetID())
 			}
 		case <-time.After(timeout):
 			return
@@ -206,22 +265,20 @@ func expectNoFrame(t *testing.T, p *peer, timeout time.Duration) {
 	}
 }
 
-// encryptedPayload 构造加密帧 payload：counter(8B 明文) + 密文。
+// encryptedPayload 构造加密帧 payload：counter(8B 明文) + 密文 28B = 36B。
+//
+// 定稿入口按 encryptedPayloadMinLen=28 判加密块；12B 的旧夹具会在入口被当作
+// 短帧丢弃，故统一做到 36B（03 §4.4）。
 func encryptedPayload(counter uint64) []byte {
-	p := make([]byte, 8+4)
+	p := make([]byte, 8+28)
 	binary.BigEndian.PutUint64(p[:8], counter)
 	return p
 }
 
-// encryptedNonHeartbeatPayload 构造**非心跳**（msgID != 0）的加密帧 payload：
-// counter(8B 明文) + 密文 28B = 36B ≥ encryptedPayloadMinLen。
-//
-// 与 encryptedPayload（仅 12B，短于阈值）的分工：后者只能验证「短帧不受拦截判据
-// 影响」，本夹具才把长度也做到达标，从而单独钉住拦截判据的 **msgID 维度**。
+// encryptedNonHeartbeatPayload 与 encryptedPayload 同形，名字强调 msgID != 0。
+// 保留独立名字是为了让「只拦心跳、不拦其它 msgID」的用例读起来有判别性。
 func encryptedNonHeartbeatPayload(counter uint64) []byte {
-	p := make([]byte, 8+28)
-	binary.BigEndian.PutUint64(p[:8], counter)
-	return p
+	return encryptedPayload(counter)
 }
 
 // frameCounter 读取帧 payload 明文前 8 字节 counter（加密帧）。
@@ -253,11 +310,19 @@ func standbyHeartbeatPayload() []byte {
 	return make([]byte, 9)
 }
 
-// encryptedHeartbeatPayload 构造**加密** HEARTBEAT（msgID=0）的 payload：
-// counter(8B 明文) + 密文（4B deviceID + 9B 原始 HEARTBEAT payload）+ tag(16B) = 37B ≥ 28。
-// 内容对路由器无意义，判据只有 msgID 与长度（§2.3/§2.5）。
+// encryptedHeartbeatPayload 构造 **QGC** 加密 HEARTBEAT（msgID=0）的 payload：
+// counter(8B 明文) + 密文（4B deviceID + 9B 原始 HEARTBEAT payload）+ tag(16B) = 37B。
+// 37B 落在 [28, T=50) ⇒ 只在 GCS 端点合法；原样投到载具端点会被入口当作畸形待命丢弃。
 func encryptedHeartbeatPayload(counter uint64) []byte {
 	p := make([]byte, 37)
+	binary.BigEndian.PutUint64(p[:8], counter)
+	return p
+}
+
+// px4EncryptedHeartbeatPayload 构造 **PX4** 加密 HEARTBEAT 的 payload：92B ≥ T=50。
+// 载具端点的 msgID=0 只有 ≥T 才会进入加密下行（03 §4.4），用 QGC 的 37B 夹具会被丢。
+func px4EncryptedHeartbeatPayload(counter uint64) []byte {
+	p := make([]byte, 92)
 	binary.BigEndian.PutUint64(p[:8], counter)
 	return p
 }
@@ -304,10 +369,10 @@ func TestSessionRouting(t *testing.T) {
 	_ = ef
 	expectNoFrame(t, other, 300*time.Millisecond) // 未配对 QGC 不收
 
-	// ---- 6. PX4 回待命心跳 → 清除该 PX4 全部配对缓存（§3.2 步骤 10）；扇出给所有在线 QGC ----
+	// ---- 6. PX4 回待命心跳 → 任务结束：清配对；只扇出给声明过该 deviceID 的 QGC ----
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second)   // qgc 收待命心跳
-	expectFrame(t, other, 1*time.Second) // other 也在线，同样收到
+	expectFrame(t, qgc, 1*time.Second)            // qgc 声明过 → 收待命心跳
+	expectNoFrame(t, other, 300*time.Millisecond) // other 空关联集合 → 不扇出（03 §4.5.1）
 
 	// ---- 7. 配对已清：PX4 加密下行不再转发 ----
 	down3 := encryptedPayload(6)
@@ -505,7 +570,7 @@ func TestUnregisteredQGCUplinkIgnored(t *testing.T) {
 // （msgID=0 + 9B payload + PX4 段 deviceID），帧内无任何可区分之处；而清除 QGC↔PX4
 // 配对缓存只应在后者发生。唯一可用的判据是该 deviceID 的**下行 lastNonce 存在**
 // （⇒ 该 PX4 已切入过加密阶段；水位缺失的唯一窗口是握手瞬间，见 manager.go 该函数注释）。
-// 若无条件清除，开机待命期间每个心跳周期清一次（PX4 待命心跳默认 20Hz），QGC 登记/保活
+// 若无条件清除，开机待命期间每个心跳周期清一次（PX4 待命心跳 1Hz），QGC 登记/保活
 // 心跳（80005）刚重建的配对无法存活到 PX4 切入加密下行。
 //
 // 三格：① 开机待命期间待命心跳不得清除配对；② 任务结束回退（下行水位存在）必须清除；
@@ -525,27 +590,33 @@ func TestStandbyClearRequiresEncryptedSession(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
 	// PX4 上电在先、QGC 后启动：此刻 qgcOnline 为空，扇出无人（qgcOnline 由 80005 填充）
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
-	// 登记后的下一个心跳周期——该 deviceID 尚无下行水位，不得清除刚建立的配对
+	// 登记后的下一个心跳周期——该 deviceID 尚无下行水位，不得清除刚建立的配对。
+	// 上一帧没有落点，不消耗发布窗口 ⇒ 这一帧必然发布并扇出到 QGC，先消费掉。
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second) // 待命心跳扇出给在线 QGC（消费，避免积压）
-	// 配对存活的判据只能是「加密下行送达」：上行路由走 px4Map、不经配对（§3.2.2 步骤 3）
+	hb := expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(0), hb.Frame.GetMessage().GetID(), "先到的是待命心跳扇出")
+	// 配对存活的判据只能是「加密下行送达」：上行路由走 px4Map/候选、不经配对（§3.2.2 步骤 3）
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(2)))
 	ef := expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
 	require.Equal(t, uint64(2), frameCounter(t, ef))
 
-	// ---- 格 2「任务结束回退」：下行水位存在 → 待命心跳必须清除配对 ----
+	// ---- 格 2「清除只发生一次」：水位随配对被一并清空 → 后续待命心跳不再触发清除 ----
+	// 任务结束清配对/映射/水位/开门的完整状态变更**无法**从外部行为观测：任务结束同时
+	// 关会话门，而开门的第一条 QGC 上行必然重建配对 ⇒「配对是否被删」在外部永远看不到。
+	// 那部分由内部用例 TestStandbyTaskEndClearsPairsAndWatermarks 直接断言；
+	// 这里只从外部钉住「清水位那行若被删，第二次心跳会清掉刚重建的配对」。
+	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	// 第一条：格 1 留下的下行水位（counter=2）⇒ 走任务结束，清配对 + 清水位，并扇出。
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second)
-	// 验证帧 counter=0：manager.go 对 counter=0 不判重放也不写水位，
-	// 故它不会污染格 3 的前置条件（回待命后 PX4 不再发加密下行，水位应保持为空）
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(0)))
-	expectNoFrame(t, qgc, 300*time.Millisecond) // 配对已清 → 不再转发
-
-	// ---- 格 3「清除只发生一次」：水位随配对被一并清空 → 后续待命心跳不再触发清除 ----
+	expectFrame(t, qgc, 1*time.Second) // 消费任务结束扇出
+	// 重建配对；同一设备的发布间隔 <2s ⇒ 第二条心跳不发布、不扇出。
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second)
+	// 若任务结束里删 waterline 的那行被移除，水位仍在 ⇒ 第二条心跳会再次清掉刚重建的
+	// 配对，末端下行不送达（已用变异体实测）。
+	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedNonHeartbeatPayload(4)))
+	_ = expectFrame(t, px4, 1*time.Second)
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(6)))
 	ef = expectFrame(t, qgc, 1*time.Second) // 配对仍存活 → 仍送达
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
@@ -572,8 +643,8 @@ func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
 	// 先发一次心跳建 px4Map（此刻无在线 QGC，扇出无人），再登记 QGC，再发心跳产生扇出
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	// 候选路径可能被 2s 聚合窗口节流，不保证有扇出可消费。
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second) // 消费扇出
 
 	// 上行水位 1001（远高于任务 2 的起点）
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(1001)))
@@ -588,8 +659,8 @@ func TestStandbyClearResetsUplinkWatermark(t *testing.T) {
 
 	// ---- 任务 2：QGC 重新登记（幂等重建，§3.2.4.1），取低于旧水位的新起点 ----
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
+	// 候选路径可能被节流；上行目标集由候选提供，不依赖这帧扇出。
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second) // 消费扇出
 
 	// 上行必须被转发：水位若残留（1001 > 3）则在此超时
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedPayload(3)))
@@ -618,10 +689,14 @@ func TestStandbyClearScopedToThatPX4(t *testing.T) {
 	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
 	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 0, standbyHeartbeatPayload()))
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID, px4DeviceIDB)))
+	// 上电那两帧没有落点（QGC 尚未登记到配对里），不消耗发布窗口 ⇒ 这两帧必然发布
+	// 并各扇出一条待命心跳，先消费掉（顺序按设备各自发送，A/B 都可能是第一条）。
 	feed(m, px4a.ch, makeFrame(aInc, aCom, aSys, aComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second) // 消费扇出
 	feed(m, px4b.ch, makeFrame(bInc, bCom, bSys, bComp, 0, standbyHeartbeatPayload()))
-	expectFrame(t, qgc, 1*time.Second) // 消费扇出
+	for i := 0; i < 2; i++ {
+		ef := expectFrame(t, qgc, 1*time.Second)
+		require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID(), "先到的是待命心跳扇出")
+	}
 
 	// 两条链路各自建链（上行建配对、下行建水位）
 	feed(m, qgc.ch, makeFrame(aInc, aCom, aSys, aComp, 33, encryptedPayload(21)))
@@ -679,7 +754,7 @@ func TestGCSHeartbeatBlockedAfterHandshake(t *testing.T) {
 	require.Equal(t, uint64(1), frameCounter(t, ef))
 
 	// ---- 格 2「PX4 发加密心跳 ⇒ 握手完成」：该帧自身不拦，照常送达配对 QGC ----
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, px4EncryptedHeartbeatPayload(2)))
 	ef = expectFrame(t, qgc, 1*time.Second)
 	require.Equal(t, uint64(2), frameCounter(t, ef))
 
@@ -725,7 +800,7 @@ func TestBlockedHeartbeatDoesNotAdvanceWatermark(t *testing.T) {
 	expectFrame(t, px4, 1*time.Second) // 消费
 
 	// PX4 加密心跳 ⇒ 握手完成（置位）
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, px4EncryptedHeartbeatPayload(2)))
 	expectFrame(t, qgc, 1*time.Second) // 消费
 
 	// 已握手：QGC 加密心跳 counter=5 被拦（不得抵达 PX4）
@@ -760,7 +835,18 @@ func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
 	// 不消费 QGC 侧的下行扇出：本用例只在 PX4 队列上断言，配对与否不影响结论。
 	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
 	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	// 先消费明文待命的扇出，否则下面会把两者混为一谈（msgID 都是 0）。
+	ef := expectFrame(t, qgc, 1*time.Second)
+	standby, ok := ef.Frame.GetMessage().(*message.MessageRaw)
+	require.True(t, ok)
+	require.Len(t, standby.Payload, 9, "期望明文待命心跳（9B，无 counter）")
+
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, px4EncryptedHeartbeatPayload(2)))
+	// P5 起建链期下行是异步验签：先消费 QGC 侧的扇出（它证明该帧已被接受、
+	// handshaked 已置位、候选已清空），否则下一帧会比状态先到。
+	ef = expectFrame(t, qgc, 1*time.Second)
+	require.Equal(t, uint32(0), ef.Frame.GetMessage().GetID())
+	require.Equal(t, uint64(2), frameCounter(t, ef), "这一帧应是加密心跳下行")
 
 	// 阴性对照：标记确已置位 ⇒ QGC 的加密心跳被拦
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(3)))
@@ -768,49 +854,9 @@ func TestNonHeartbeatEncryptedUplinkNotBlocked(t *testing.T) {
 
 	// 正题：长度同样达标、但 msgID != 0 的加密上行必须放行
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 33, encryptedNonHeartbeatPayload(5)))
-	ef := expectFrame(t, px4, 1*time.Second)
+	ef = expectFrame(t, px4, 1*time.Second)
 	require.Equal(t, uint32(33), ef.Frame.GetMessage().GetID())
 	require.Equal(t, uint64(5), frameCounter(t, ef))
-}
-
-// TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark 守复位点的**无条件性**：
-// 「已建链标记」的复位不得附加「该 deviceID 存在下行水位」这一前提——后者只是**清配对**
-// 的前提（见 TestStandbyClearRequiresEncryptedSession），两者不是同一个条件。
-//
-// 依据：manager.go 写下行水位的那句是 `if nk != nil`，而 counter=0 的帧既不判重放也不
-// 写水位，置位判据（msgID=0 且 plen ≥ 28）却与 counter 无关 ⇒「已置位、但无下行水位」
-// 是**可达状态**，一条 counter=0 的加密心跳即可造出来。
-//
-// 若复位被改成与清配对同一个前提，标记在该状态下永久卡住 ⇒ 该 PX4 下一会话的首帧加密
-// 上行心跳被拦、链路再也建不起来（§2.5「该复位无前提条件」）。
-func TestStandbyResetsHandshakeFlagWithoutDownlinkWatermark(t *testing.T) {
-	node, m, vehiclePort, gcsPort, stop := newServer(t)
-	defer stop()
-
-	qgc := connectQGC(t, node, gcsPort)
-	px4 := connectPX4(t, node, vehiclePort)
-
-	pInc, pCom, pSys, pComp := didBytes(px4DeviceID)
-
-	// 前置：QGC 登记 + PX4 明文待命心跳
-	feed(m, qgc.ch, makeFrame(0, 0, 0x27, 0x10, 80005, registrationPayload(px4DeviceID)))
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-
-	// counter=0 的加密心跳：置位「已建链」，但**不写下行水位**（counter=0 无 nonce key）；
-	// 此时尚无配对，该下行帧也不扇出给任何 QGC。
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(0)))
-
-	// 阴性对照：标记确已置位 ⇒ QGC 的加密心跳被拦
-	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(3)))
-	expectNoFrame(t, px4, 300*time.Millisecond)
-
-	// 明文待命心跳：必须复位标记（此刻并无下行水位，清配对的前提并不成立）
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, standbyHeartbeatPayload()))
-
-	// 复位后：QGC 的加密心跳必须恢复放行
-	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(7)))
-	ef := expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint64(7), frameCounter(t, ef))
 }
 
 // ---- 双端点方向判定的判别性用例 ----
@@ -1045,12 +1091,12 @@ func TestRequestDataStreamPlaintextBlockedOnBothEndpoints(t *testing.T) {
 	require.Equal(t, uint32(66), ef.Frame.GetMessage().GetID())
 	require.Equal(t, uint64(2), frameCounter(t, ef))
 
-	// 开关面：--streamreq-disable 打开后明文 66 放行（上游选项语义不变）。
+	// 开关面：--streamreq-disable 打开后，明文 66 仍被入口短帧闸丢弃。
+	// 03 §4.4 的通用规则「其它 msgID payload <28B 两端丢弃」优先于该开关；开关只影响
+	// 上游那条专项拦截，不再改变可观察结果（明文 66 在任何配置下都进不了路由）。
 	m.StreamReqDisable = true
 	feed(m, qgc.ch, makeFrame(pInc, pCom, pSys, pComp, 66, []byte{0, 0, 0, 1, 0}))
-	ef = expectFrame(t, px4, 1*time.Second)
-	require.Equal(t, uint32(66), ef.Frame.GetMessage().GetID(),
-		"StreamReqDisable 没有关掉拦截 ⇒ 该开关形同虚设")
+	expectNoFrame(t, px4, 300*time.Millisecond)
 }
 
 // TestMultipleVehicleEndpointsRouteByDeviceID 钉住「多个载具端点」的装配：每个载具端点

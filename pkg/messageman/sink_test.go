@@ -10,8 +10,10 @@ import (
 )
 
 // fakeSink 记录交给下游（FIFO / 管理出口）的全部帧。
-// ProcessFrame 由 messageman 在喂帧的同一 goroutine 内同步调用，
-// 故 feed() 返回后即可直接断言，无需等待。
+//
+// ‼️ ProcessFrame **可能被并发调用**：D13 免验签下行与待命心跳在主事件循环里同步喂，
+// 验签通过的下行则由每设备一个 drain goroutine 喂（messageman/verify.go 的 drain）。
+// 所以 Sink 的实现必须自带同步；本夹具用锁，测试断言前用 Eventually 等待异步落点。
 type fakeSink struct {
 	mu     sync.Mutex
 	msgIDs []uint32
@@ -75,7 +77,7 @@ func TestSinkDownlinkOnly(t *testing.T) {
 		"格 2：QGC 上行心跳不得进下游（§3.2.5：FIFO 内容只含下行帧 + PX4 明文待命心跳）")
 
 	// ---- 格 3「PX4 加密心跳」：置位握手；它本身是下行，必须进下游 ----
-	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, encryptedHeartbeatPayload(2)))
+	feed(m, px4.ch, makeFrame(pInc, pCom, pSys, pComp, 0, px4EncryptedHeartbeatPayload(2)))
 	expectFrame(t, qgc, 1*time.Second) // 送达配对 QGC，消费
 	require.Equal(t, []uint32{0, 0}, sink.got(), "格 3：PX4 加密心跳是下行，必须进下游")
 

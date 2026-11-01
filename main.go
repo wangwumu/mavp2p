@@ -154,27 +154,39 @@ var cli struct {
 	// 本 fork 的 dialect 为空（全部 MessageRaw 透传），gomavlib 的节点心跳与自动
 	// stream-request 都以 errSkip 退出 ⇒ 下列 --hb-* 与 --streamreq-frequency 不生效；
 	// 保留这些 flag 只为与上游命令行兼容。
-	HbDisable          bool          `help:"（本 fork 不生效：空 dialect 不发射节点心跳）Disable heartbeats."`
-	HbVersion          int           `enum:"1,2" help:"（本 fork 不生效）Mavlink version of heartbeats." default:"1"`
-	HbSystemid         int           `default:"125"`
-	HbComponentid      int           `help:"（本 fork 不生效）Component ID of heartbeats." default:"191"`
-	HbPeriod           int           `help:"（本 fork 不生效）Period of heartbeats." default:"5"`
-	StreamreqDisable   bool          `help:"关闭明文 RequestDataStream（msgID 66、payload<28B）的入口丢弃；默认两个端点都丢。注意它**不是**上游『自动请求』的开关——空 dialect 下自动请求本就不发生。"`
-	StreamreqFrequency int           `help:"（本 fork 不生效：空 dialect 不发起 stream request）Stream frequency to request." default:"4"`
-	Dump               bool          `help:"Dump telemetry to disk"`
-	DumpPath           string        `default:"dump/2006-01-02_15-04-05.tlog"`
-	DumpDuration       time.Duration `help:"Maximum duration of each dump segment" default:"1h"`
-	FifoEnable         bool          `help:"Enable FIFO-based filtered message output."`
-	FifoPath           string        `default:"/tmp/mavp2p-filter.fifo"`
-	FifoConfig         string        `default:"../filter.yaml"`
-	FifoFallbackPath   string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
-	FifoMgmtEndpoint   string        `help:"管理出口：写 FIFO 的同时用 UDP 把同一份报文镜像到该 ip:port。报文格式＝FIFO 那份（8B 时间戳+帧字节），是本仓库自定的约定；规范附录 A.1 的 MANAGEMENT_ENDPOINT 被标注为待定、不在协议范围。空=关闭，须同时开 --fifo-enable。"`
-	GCSDeviceIDMax     uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
-	MaxQGCLinkedPX4    int           `help:"单帧 80005 声明的台数上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）；不是该 QGC 的关联总数，超过需分片" default:"16"`
-	MapTTL             time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
-	StateIdleTimeout   time.Duration `help:"长期状态表空闲回收阈值：配对与防重放水位在加密流量静默超过该时长后回收（80005 周期登记不算流量）；诊断表各有自己的判据，见 messageman.prune" default:"10m"`
-	GCSEndpoint        string        `help:"地面站入口端点（QGC→载具的上行入口），写法与位置参数相同，例如 udps:0.0.0.0:5601。方向由入口端点决定：本端点进来的帧一律按上行，位置参数（载具端点）进来的帧一律按下行。必须配置，且不得与任何载具端点相同。"`
-	Endpoints          []string      `arg:"" optional:""`
+	HbDisable                bool          `help:"（本 fork 不生效：空 dialect 不发射节点心跳）Disable heartbeats."`
+	HbVersion                int           `enum:"1,2" help:"（本 fork 不生效）Mavlink version of heartbeats." default:"1"`
+	HbSystemid               int           `default:"125"`
+	HbComponentid            int           `help:"（本 fork 不生效）Component ID of heartbeats." default:"191"`
+	HbPeriod                 int           `help:"（本 fork 不生效）Period of heartbeats." default:"5"`
+	StreamreqDisable         bool          `help:"关闭明文 RequestDataStream（msgID 66、payload<28B）的入口丢弃；默认两个端点都丢。注意它**不是**上游『自动请求』的开关——空 dialect 下自动请求本就不发生。"`
+	StreamreqFrequency       int           `help:"（本 fork 不生效：空 dialect 不发起 stream request）Stream frequency to request." default:"4"`
+	Dump                     bool          `help:"Dump telemetry to disk"`
+	DumpPath                 string        `default:"dump/2006-01-02_15-04-05.tlog"`
+	DumpDuration             time.Duration `help:"Maximum duration of each dump segment" default:"1h"`
+	FifoEnable               bool          `help:"Enable FIFO-based filtered message output."`
+	FifoPath                 string        `default:"/tmp/mavp2p-filter.fifo"`
+	FifoConfig               string        `default:"../filter.yaml"`
+	FifoFallbackPath         string        `default:"/tmp/mavp2p-filter-fallback.tlog"`
+	FifoMgmtEndpoint         string        `help:"管理出口：写 FIFO 的同时用 UDP 把同一份报文镜像到该 ip:port。报文格式＝FIFO 那份（8B 时间戳+帧字节），是本仓库自定的约定；规范附录 A.1 的 MANAGEMENT_ENDPOINT 被标注为待定、不在协议范围。空=关闭，须同时开 --fifo-enable。"`
+	GCSDeviceIDMax           uint32        `help:"GCS 段上界（protocol 附录 A.1 GCS_DEVICE_ID_MAX）" default:"10000000"`
+	MaxQGCLinkedPX4          int           `help:"单帧 80005 声明的台数上限（protocol 附录 A.1 MAX_QGC_LINKED_PX4）；不是该 QGC 的关联总数，超过需分片" default:"16"`
+	MapTTL                   time.Duration `help:"mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）" default:"60s"`
+	StateIdleTimeout         time.Duration `help:"长期状态表空闲回收阈值：配对与防重放水位在加密流量静默超过该时长后回收（80005 周期登记不算流量）；诊断表各有自己的判据，见 messageman.prune" default:"10m"`
+	StandbyGuard             time.Duration `help:"待命心跳防伪造闸的时间窗：该机近期有加密下行时，来自其它通道的明文待命心跳整帧丢弃。明文心跳无认证，无闸时一帧即可清配对/水位并改道上行；同通道（合法任务结束）不受影响" default:"5m"`
+	StandbyFanoutInterval    time.Duration `help:"每设备候选发布（扇出/Sink）聚合窗口；窗口内多帧合并为一次发布，任务结束路径不受限" default:"2s"`
+	MaxCandidatesPerDevice   int           `help:"每设备上行候选上限（含至多 1 条保护候选）" default:"3"`
+	MaxCandidatesGlobal      int           `help:"候选表总条数上限；满时拒绝新 deviceID 的普通候选（已有设备刷新不受影响）" default:"4096"`
+	CandidateAdmitInterval   time.Duration `help:"每设备新增来源 IP 的最小间隔（刷新已有候选不受限）" default:"1s"`
+	GlobalCandidateAdmitRate int           `help:"全局新候选准入速率，令牌单位＝一次「新来源 IP 入表」" default:"50"`
+	GlobalFanoutRate         int           `help:"全局候选发布预算，令牌单位＝一次聚合发布（不是帧数）" default:"100"`
+	MaxUplinkTargets         int           `help:"上行目标集上限（含已验签通道），必须 ≥2；歧义期多播给目标集" default:"3"`
+	VerifySocket             string        `help:"本地验签服务 Unix socket（oracle）。建链期/换通道的下行需要验签；服务不可用时这些帧 fail-closed 丢弃，已建链同通道帧不受影响" default:"/run/uavm/verify.sock"`
+	VerifyTimeout            time.Duration `help:"单次验签请求超时；超时按失败丢弃该帧" default:"5ms"`
+	VerifyQueuePerDevice     int           `help:"每设备验签排队上限（同一时刻 1 个 in-flight，按入队顺序处理）" default:"8"`
+	VerifyQueueGlobal        int           `help:"全局验签排队上限；满时丢弃最新帧（不阻塞事件循环）" default:"256"`
+	GCSEndpoint              string        `help:"地面站入口端点（QGC→载具的上行入口），写法与位置参数相同，例如 udps:0.0.0.0:5601。方向由入口端点决定：本端点进来的帧一律按上行，位置参数（载具端点）进来的帧一律按下行。必须配置，且不得与任何载具端点相同。"`
+	Endpoints                []string      `arg:"" optional:""`
 }
 
 type program struct {
@@ -437,12 +449,6 @@ func newProgram(args []string) (*program, error) {
 			case "hb-systemid":
 				return "System ID of heartbeats. It is recommended to set a different system id for each router in the network."
 
-			case "streamreq-disable":
-				return "Do not request streams to Ardupilot devices," +
-					" that need an explicit request in order to emit telemetry streams." +
-					" This task is usually delegated to the router," +
-					" in order to avoid conflicts when multiple ground stations are active."
-
 			case "endpoints":
 				desc := "Space-separated list of **vehicle** endpoints (PX4 → mavp2p, downlink ingress). " +
 					"At least one is required. Ground stations connect to --gcs-endpoint instead; " +
@@ -530,6 +536,54 @@ func newProgram(args []string) (*program, error) {
 	// 这与 MapTTL/StateIdleTimeout 的负值拒绝口径一致：配置写反要当场暴露。
 	if cli.UDPSendDelay < 0 {
 		return nil, fmt.Errorf("--udp-send-delay 不能为负（0=关闭）：%s", cli.UDPSendDelay)
+	}
+	// 负窗口会让防伪造闸恒不成立（静默退化成无防护）。零值是兜底默认，负值必须当场拒绝。
+	if cli.StandbyGuard < 0 {
+		return nil, fmt.Errorf("--standby-guard 不能为负（0=默认 5m）：%s", cli.StandbyGuard)
+	}
+	if cli.MapTTL < 0 {
+		return nil, fmt.Errorf("--map-ttl 不能为负（0=默认 60s）：%s", cli.MapTTL)
+	}
+	if cli.StateIdleTimeout < 0 {
+		return nil, fmt.Errorf("--state-idle-timeout 不能为负（0=默认 10m）：%s", cli.StateIdleTimeout)
+	}
+	// 03 §4.11：时长参数负值拒绝；计数与速率参数一律 ≥1（0 不是「不限」）。
+	// 显式写 0 会让对应机制静默关闭（例如 0 个候选 = 歧义期没有任何上行目标）。
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{
+		{"standby-fanout-interval", cli.StandbyFanoutInterval},
+		{"candidate-admit-interval", cli.CandidateAdmitInterval},
+		{"verify-timeout", cli.VerifyTimeout},
+	} {
+		if d.v < 0 {
+			return nil, fmt.Errorf("--%s 不能为负：%s", d.name, d.v)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		v    int
+	}{
+		{"max-candidates-per-device", cli.MaxCandidatesPerDevice},
+		{"max-candidates-global", cli.MaxCandidatesGlobal},
+		{"global-candidate-admit-rate", cli.GlobalCandidateAdmitRate},
+		{"global-fanout-rate", cli.GlobalFanoutRate},
+		{"max-uplink-targets", cli.MaxUplinkTargets},
+		{"verify-queue-per-device", cli.VerifyQueuePerDevice},
+		{"verify-queue-global", cli.VerifyQueueGlobal},
+	} {
+		if c.v < 1 {
+			return nil, fmt.Errorf("--%s 必须 ≥1（0 不是「不限」）：%d", c.name, c.v)
+		}
+	}
+	// 只留 1 个上行目标时，换端口的真机在晋升前收不到上行（目标集含已验签通道）。
+	if cli.MaxUplinkTargets < 2 {
+		return nil, fmt.Errorf("--max-uplink-targets 必须 ≥2（当前 %d）："+
+			"目标集只含已验签通道时，换端口的真机在晋升前收不到上行", cli.MaxUplinkTargets)
+	}
+	if cli.VerifySocket == "" {
+		return nil, fmt.Errorf("--verify-socket 不能为空：建链期下行需要本地验签服务")
 	}
 
 	// GCS 入口端点：方向由入口端点决定，故它是**必填**的。不提供「没配就退回单端口、
@@ -637,6 +691,19 @@ func newProgram(args []string) (*program, error) {
 			MaxQGCLinkedPX4:  cli.MaxQGCLinkedPX4,
 			MapTTL:           cli.MapTTL,
 			StateIdleTimeout: cli.StateIdleTimeout,
+			StandbyGuard:     cli.StandbyGuard,
+
+			StandbyFanoutInterval:    cli.StandbyFanoutInterval,
+			MaxCandidatesPerDevice:   cli.MaxCandidatesPerDevice,
+			MaxCandidatesGlobal:      cli.MaxCandidatesGlobal,
+			CandidateAdmitInterval:   cli.CandidateAdmitInterval,
+			GlobalCandidateAdmitRate: cli.GlobalCandidateAdmitRate,
+			GlobalFanoutRate:         cli.GlobalFanoutRate,
+			MaxUplinkTargets:         cli.MaxUplinkTargets,
+			VerifySocket:             cli.VerifySocket,
+			VerifyTimeout:            cli.VerifyTimeout,
+			VerifyQueuePerDevice:     cli.VerifyQueuePerDevice,
+			VerifyQueueGlobal:        cli.VerifyQueueGlobal,
 			// 端点对象必须与 Node.Endpoints 里的**同一批指针**：roleOf 用指针比较
 			// 认通道来源，另建一份内容相同的端点会让所有帧都判成 roleUnknown。
 			GCSEndpoint:      gcsEndpoint,
@@ -700,7 +767,7 @@ func newProgram(args []string) (*program, error) {
 	}
 
 	log.Printf("mavp2p %s", version)
-	log.Printf("router started with %d vehicle %s, GCS endpoint %s, udp-send-delay=%s",
+	log.Printf("router started with %d vehicle %s, GCS endpoint %s, udp-send-delay=%s, standby-guard=%s, verify-socket=%s",
 		len(endpointConfs),
 		func() string {
 			if len(endpointConfs) == 1 {
@@ -709,7 +776,9 @@ func newProgram(args []string) (*program, error) {
 			return "endpoints"
 		}(),
 		cli.GCSEndpoint,
-		cli.UDPSendDelay)
+		cli.UDPSendDelay,
+		cli.StandbyGuard,
+		cli.VerifySocket)
 
 	p.wg.Add(1)
 	go p.run()

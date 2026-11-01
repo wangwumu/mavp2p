@@ -16,6 +16,11 @@
 > - **有状态会话路由器**（`pkg/messageman`）：按帧头 deviceID 号段（GCS 段 / PX4 段）+
 >   **入口端点决定的上下行方向** + msgID/payload 长度路由 QGC↔PX4 会话，支撑多 QGC / 多 PX4
 >   广域网（NAT/VPN）场景。**不解密**——加密任务帧按原样透传（空 dialect，全部 `MessageRaw`）。
+>   但**建链期的下行、以及换通道后的首帧必须验签**：mavp2p 自己不持有密钥，而是把待验帧
+>   交给本机 Unix socket 上的**本地验签服务**（`--verify-socket`，由 **data_writer 进程内
+>   的 oracle goroutine 提供**）。服务不可用时这些帧 fail-closed 丢弃；已建链、同通道的
+>   加密帧不受影响（免验签，D13）。**部署顺序：先起 data_writer，再起 mavp2p**，否则新
+>   链路永远起不来（已在运行的链路不受影响）。
 > - **两个入口端点（必填）**：`--gcs-endpoint`（或 YAML `gcs_endpoint`）收地面站，位置参数
 >   收载具。方向**只**由帧从哪个端点进来决定：GCS 端点 = 上行，载具端点 = 下行。
 >   不读 counter 的奇偶。缺 `--gcs-endpoint`、或它与某个载具端点相同 ⇒ 拒绝启动。
@@ -26,8 +31,13 @@
 > - **明文待命心跳**（msgID=0, PX4 段, payload<28）：登记 PX4 映射，扇出给在线 QGC。
 > - **边缘防重放**：读明文 counter，按 deviceID × **入口方向**（上行/下行各一条水位）尽力判重；
 >   counter 的奇偶不参与任何判定。
+> - **候选表与上行目标集**：待命心跳的扇出目标、加密上行要投给哪台 QGC，先按 `deviceID`
+>   记入候选表（每设备/全局容量、准入速率、发布窗口均可调），歧义期**多播**给目标集而不是
+>   赌一条通道。这是为 NAT 重建 / 多 QGC 并存时的来源漂移准备的。
+> - **会话门 + 换通道晋升**：任务结束后该 deviceID 的门关闭，下一条开门帧必须重新验签才
+>   建立新的会话通道；同通道已握手（handshaked）的帧免验签。
 > - **FIFO → data_writer**：`--fifo-enable` 把下行帧经命名管道转 data_writer（消息白名单见
->   `filter.yaml`）。
+>   `filter.yaml`；白名单须包含 msgID **0**，否则 data_writer 失去待命心跳这一活跃度来源）。
 >
 > 上游通用功能（多端点桥接、串口/TCP/UDP、域名、重连等）仍可用。
 
@@ -154,8 +164,16 @@ Session-router parameters (protocol 附录 A.1, must match QGC/PX4 on all three 
 | `--gcs-device-id-max` | `10000000` | GCS 段上界：deviceID < 该值判为 QGC/地面站，≥ 判为 PX4 |
 | `--max-qgc-linked-px-4` | `16` | **单帧** 80005 声明的台数上限，不是该 QGC 的关联总数（超过需分片，一轮 = `ceil(n/16)×10s`） |
 | `--map-ttl` | `60s` | 路由表存活 TTL（PX4 映射 / QGC 在线 / 配对） |
-| `--state-idle-timeout` | `10m` | 长期状态表空闲回收阈值：配对、防重放水位、`hbDiag`/`fanoutDiag`/`dropDiag`；`regDiag` 例外，随 `qgcOnline` 成员关系回收 |
+| `--state-idle-timeout` | `10m` | 长期状态表空闲回收阈值：配对、防重放水位、`hbDiag`/`fanoutDiag`/`verifyDiag`/`dropDiag`；`regDiag` 例外，随 `qgcOnline` 成员关系回收 |
+| `--standby-guard` | `5m` | 待命心跳防伪造闸的时间窗。该机近期仍有加密下行（或下行水位新鲜）时，来自**其它通道**的明文待命心跳整帧丢弃；同通道（合法任务结束）不受影响。明文心跳无认证，无闸时一帧即可清配对/水位并改道上行。负值拒绝启动 |
 | `--udp-send-delay` | `1µs` | 每个 UDP 数据报写出后在该通道写协程内等待的间隔，避免连续写包、给内核排空发送缓冲区留时间（`0`=关闭，负值拒绝启动）。只作用于 UDP（datagram 端点）：TCP 也会调用但立即返回（不生效）。`time.Sleep` 会向上取整：请求 1µs 在本机实测约 30–40µs。⚠️ 写在 YAML 里必须带单位：`udp_send_delay: 0s`，裸 `0` 会被当作无单位时长拒绝 |
+| `--verify-socket` | `/run/uavm/verify.sock` | 本地验签服务（**data_writer 进程内的 oracle**）的 Unix socket。建链期下行/换通道首帧必须验签；服务不可用 ⇒ 这些帧 fail-closed 丢弃（已建链同通道帧不受影响）。**先起 data_writer 再起 mavp2p**，不可为空 |
+| `--verify-timeout` | `5ms` | 单次验签请求超时，超时按失败处理（丢该帧） |
+| `--max-uplink-targets` | `3` | 上行目标集上限（含已验签通道），必须 ≥2；候选未收敛时上行多播给目标集 |
+
+其余候选表/扇出窗口/验签排队参数（`--standby-fanout-interval`、`--max-candidates-*`、
+`--candidate-admit-interval`、`--global-*-rate`、`--verify-queue-*`）见
+[`mavp2p.yaml`](mavp2p.yaml) 的注释与 `--help`。
 
 ## Connecting popular software
 
@@ -314,7 +332,30 @@ Flags:
                                   MAX_QGC_LINKED_PX4）；不是该 QGC 的关联总数，超过需分片
       --map-ttl=60s               mavp2p 映射/在线/配对缓存 TTL（protocol 附录 A.1 MAP_TTL）
       --state-idle-timeout=10m    长期状态表空闲回收阈值：配对与防重放水位在加密流量静默超过该时长后回收（80005
-                                  周期登记不算流量）；诊断表各有自己的判据，见 messageman.prune
+                                  周期登记不算流量）；hbDiag/fanoutDiag/verifyDiag 按最后写入时刻、
+                                  dropDiag 按上次告警时刻回收，见 messageman.prune
+      --standby-guard=5m          待命心跳防伪造闸的时间窗：该机近期有加密下行时，来自其它通道的明文待命心跳整帧
+                                  丢弃。明文心跳无认证，无闸时一帧即可清配对/水位并改道上行；同通道（合法任务结束）
+                                  不受影响
+      --standby-fanout-interval=2s
+                                  每设备候选发布的聚合窗口；窗口内多帧合并为一次扇出/Sink 发布，任务结束路径
+                                  不受限
+      --max-candidates-per-device=3
+                                  每设备上行候选上限（含至多 1 条保护候选）
+      --max-candidates-global=4096
+                                  候选表总条数上限；满时拒绝新 deviceID 的普通候选（已有设备刷新不受影响）
+      --candidate-admit-interval=1s
+                                  每设备新增来源 IP 的最小间隔（刷新已有候选不受限）
+      --global-candidate-admit-rate=50
+                                  全局新候选准入速率，令牌单位＝一次「新来源 IP 入表」
+      --global-fanout-rate=100    全局候选发布预算，令牌单位＝一次聚合发布（不是帧数）
+      --max-uplink-targets=3      上行目标集上限（含已验签通道），必须 ≥2；歧义期多播给目标集
+      --verify-socket="/run/uavm/verify.sock"
+                                  本地验签服务 Unix socket（oracle，由 data_writer 进程提供）。建链期/换通道的
+                                  下行需要验签；服务不可用时这些帧 fail-closed 丢弃，已建链同通道帧不受影响
+      --verify-timeout=5ms        单次验签请求超时；超时按失败丢弃该帧
+      --verify-queue-per-device=8 每设备验签排队上限（同一时刻 1 个 in-flight，按入队顺序处理）
+      --verify-queue-global=256   全局验签排队上限；满时丢弃最新帧（不阻塞事件循环）
       --gcs-endpoint=STRING       地面站入口端点（QGC→载具的上行入口），写法与位置参数相同，例如
                                   udps:0.0.0.0:5601。方向由入口端点决定：本端点进来的帧一律按上行，位置参数（载具端点）进来的帧一律按下行。必须配置，且不得与任何载具端点相同。
 ```

@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/binary"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,6 +168,10 @@ func TestProgramFifoDownstreamWiring(t *testing.T) {
 	port := freePort(t)
 	gcsPort := freePort(t)
 
+	// 建链期下行必须过验签。真实启动路径由 CLI（--verify-socket 等）注入；本用例直接改 Manager 配置。
+	verifyPath, stopOracle := startTestOracle(t)
+	defer stopOracle()
+
 	p, err := newProgram([]string{
 		"tcps:0.0.0.0:" + itoa(port),
 		"--gcs-endpoint", "tcps:0.0.0.0:" + itoa(gcsPort),
@@ -178,6 +184,8 @@ func TestProgramFifoDownstreamWiring(t *testing.T) {
 	})
 	require.NoError(t, err)
 	defer p.close()
+	p.messageMan.VerifySocket = verifyPath
+	p.messageMan.VerifyTimeout = time.Second
 
 	// 接线本身：Sink 必须**就是** fifoFilter（忘注入 ⇒ FIFO 静默全盲）
 	sink, ok := p.messageMan.Sink.(*fifofilter.Manager)
@@ -212,8 +220,10 @@ func TestProgramFifoDownstreamWiring(t *testing.T) {
 	// 登记与待命心跳走两条 TCP 连接，到达顺序不确定；待命心跳先到的话扇出名单里还没有
 	// QGC（真机日志实测过这个竞态）。原文用固定 `time.Sleep(150ms)` 是在赌调度——
 	// 改成**重发直到 QGC 收到**：该心跳 payload 全零、重发幂等，观察条件就是断言本身。
+	// 候选路径每设备有 2s 聚合窗口（03 §4.3.2）：窗口内的重发不会再次发布，
+	// 重发跨度必须超过 2s，否则登记晚到后等不到下一次放行。
 	var standby *gomavlib.EventFrame
-	for i := 0; i < 20 && standby == nil; i++ {
+	for i := 0; i < 40 && standby == nil; i++ {
 		require.NoError(t, px4.WriteFrameAll(testFrame(px4DeviceID, 0, make([]byte, 9))))
 		standby = tryWaitFrame(qgc, 100*time.Millisecond)
 	}
@@ -401,6 +411,17 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 			wantSub: "必须写成带单位的字符串",
 		},
 		{
+			name:    "待命心跳防伪造窗口同样是 duration，裸数字同样要拒",
+			yaml:    "standby_guard: 300\n",
+			wantSub: "必须写成带单位的字符串",
+		},
+		{
+			// 负值会让防伪造闸恒不成立（静默退化成无防护），与 udp_send_delay 同一口径。
+			name:    "负的待命心跳防伪造窗口必须拒绝，而不是静默关闭防护",
+			yaml:    "standby_guard: -1s\n",
+			wantSub: "不能为负",
+		},
+		{
 			// 负值会被 gomavlib 的 `WriteDelay <= 0` 当成「关闭」：不拒绝的话，
 			// `-1s` 会静默关闭节流，启动日志之外没有任何提示。
 			name:    "负的 UDP 发包间隔必须拒绝，而不是静默关闭",
@@ -408,10 +429,45 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 			wantSub: "不能为负",
 		},
 		{
+			// 03 §4.11：计数与速率参数「0 不是不限」。显式 0 会让对应机制静默关闭
+			// （0 个队位 = 每帧验签都失败），所以必须当场拒绝而不是退回默认值。
+			name:    "验签队列上限写 0 必须拒绝，而不是静默变成「每帧都失败」",
+			yaml:    "verify_queue_per_device: 0\n",
+			wantSub: "必须 ≥1",
+		},
+		{
+			name:    "全局验签队列上限写 0 同样必须拒绝",
+			yaml:    "verify_queue_global: 0\n",
+			wantSub: "必须 ≥1",
+		},
+		{
+			// 负超时会让 net.DialTimeout/SetDeadline 立即到期：所有建链期下行都被判超时，
+			// 飞机永远上不了线，而日志只说 timeout，排障时看不出是配置错。
+			name:    "负的验签超时必须拒绝，而不是让所有建链期下行立即超时",
+			yaml:    "verify_timeout: -1ms\n",
+			wantSub: "不能为负",
+		},
+		{
+			// 目标集只含已验签通道时，换端口的真机在晋升前收不到上行；1 也不行。
+			name:    "上行目标集上限写 1 必须拒绝（真机换端口后收不到上行）",
+			yaml:    "max_uplink_targets: 1\n",
+			wantSub: "必须 ≥2",
+		},
+		{
+			// 空串不是「关闭验签」：建链期下行需要 oracle，空 socket 会让每次 Dial 都失败。
+			// 要关防护得改实现，不能靠配置静默退化。
+			name:    "空的验签 socket 必须拒绝，而不是静默让建链期下行全丢",
+			yaml:    "verify_socket: \"\"\n",
+			wantSub: "不能为空",
+		},
+		{
 			// 这一格同时是**接线**断言（见下方 Assert）：值取非默认，才能区分「真的接上了」
-			// 与「漏了注入、静默用默认值」。默认值是 10m，所以这里写 30m。
+			// 与「漏了注入、静默用默认值」。默认值分别是 10m / 5m，所以这里写 30m / 2m。
 			name: "阴性对照：两种正确写法都必须能起来，且值真的接到 Manager 上",
-			yaml: "map_ttl: 30s\nmapTtl: 30s\nstate_idle_timeout: 30m\nudp_send_delay: 2µs\n",
+			yaml: "map_ttl: 30s\nmapTtl: 30s\nstate_idle_timeout: 30m\nstandby_guard: 2m\nudp_send_delay: 2µs\n" +
+				"standby_fanout_interval: 3s\ncandidate_admit_interval: 4s\nglobal_fanout_rate: 17\n" +
+				"max_uplink_targets: 5\nverify_socket: /tmp/mavp2p-test-oracle.sock\n" +
+				"verify_timeout: 7ms\nverify_queue_per_device: 9\nverify_queue_global: 257\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,10 +489,30 @@ func TestProgramConfigRejectsBadKeyOrBareDuration(t *testing.T) {
 				// `StateIdleTimeout: cli.StateIdleTimeout` 那一行，程序照常启动、参数静默失效。
 				require.Equal(t, 30*time.Minute, p.messageMan.StateIdleTimeout,
 					"配置文件里的 state_idle_timeout 没接到 messageman.Manager ⇒ 参数形同虚设")
+				require.Equal(t, 2*time.Minute, p.messageMan.StandbyGuard,
+					"配置文件里的 standby_guard 没接到 messageman.Manager ⇒ 防伪造窗口形同虚设")
 				require.Equal(t, 30*time.Second, p.messageMan.MapTTL,
 					"配置文件里的 map_ttl 没接到 messageman.Manager")
 				require.Equal(t, 2*time.Microsecond, p.node.WriteDelay,
 					"配置文件里的 udp_send_delay 没接到 gomavlib.Node")
+				// 03 §4.11 新增参数的接线断言：同样取非默认值。门限类参数漏注入时
+				// 程序照常启动、静默用默认值，只有值驱动行为时才看得出来。
+				require.Equal(t, 3*time.Second, p.messageMan.StandbyFanoutInterval,
+					"配置文件里的 standby_fanout_interval 没接到 messageman.Manager")
+				require.Equal(t, 4*time.Second, p.messageMan.CandidateAdmitInterval,
+					"配置文件里的 candidate_admit_interval 没接到 messageman.Manager")
+				require.Equal(t, 17, p.messageMan.GlobalFanoutRate,
+					"配置文件里的 global_fanout_rate 没接到 messageman.Manager")
+				require.Equal(t, 5, p.messageMan.MaxUplinkTargets,
+					"配置文件里的 max_uplink_targets 没接到 messageman.Manager")
+				require.Equal(t, "/tmp/mavp2p-test-oracle.sock", p.messageMan.VerifySocket,
+					"配置文件里的 verify_socket 没接到 messageman.Manager ⇒ 验签永远连不上")
+				require.Equal(t, 7*time.Millisecond, p.messageMan.VerifyTimeout,
+					"配置文件里的 verify_timeout 没接到 messageman.Manager")
+				require.Equal(t, 9, p.messageMan.VerifyQueuePerDevice,
+					"配置文件里的 verify_queue_per_device 没接到 messageman.Manager")
+				require.Equal(t, 257, p.messageMan.VerifyQueueGlobal,
+					"配置文件里的 verify_queue_global 没接到 messageman.Manager")
 				return
 			}
 			require.Error(t, err, "配置写错必须在启动前拒绝，而不是静默退回默认值：%s", tc.yaml)
@@ -505,6 +581,8 @@ func TestProgramConfigEndpointsAdopted(t *testing.T) {
 	// 只改 kong tag 而忘了文档/运维口径，或把默认改成 0（pacing 静默消失）都要红。
 	require.Equal(t, 10*time.Minute, p.messageMan.StateIdleTimeout,
 		"state_idle_timeout 的启动默认值不是 10m")
+	require.Equal(t, 5*time.Minute, p.messageMan.StandbyGuard,
+		"standby_guard 的启动默认值不是 5m（0 会让防伪造闸静默消失）")
 	require.Equal(t, time.Microsecond, p.node.WriteDelay,
 		"udp_send_delay 的启动默认值不是 1µs（0 会让节流静默消失）")
 
@@ -626,8 +704,10 @@ func TestProgramHighDeviceIDPassesParser(t *testing.T) {
 			// PX4 发**明文待命心跳**（msgID=0、payload 9B），帧头 deviceID = tc.did。
 			// 登记与待命心跳走两条 TCP 连接，到达顺序不确定 ⇒ 重发直到 QGC 收到
 			// （payload 全零、重发幂等，观察条件就是断言本身）。
+			// 候选路径每设备有 2s 聚合窗口（03 §4.3.2）：窗口内的重发不会再次发布，
+			// 重发跨度须超过 2s，否则登记晚到的那一轮永远等不到下一次放行。
 			var standby *gomavlib.EventFrame
-			for i := 0; i < 20 && standby == nil; i++ {
+			for i := 0; i < 40 && standby == nil; i++ {
 				require.NoError(t, px4.WriteFrameAll(testFrame(tc.did, 0, make([]byte, 9))))
 				standby = tryWaitFrame(qgc, 100*time.Millisecond)
 			}
@@ -708,7 +788,8 @@ func uplinkFrame(t *testing.T, counter uint64, heartbeat bool) []byte {
 func downlinkFrame(t *testing.T, counter uint64, heartbeat bool) []byte {
 	t.Helper()
 	if heartbeat {
-		return encryptedHeartbeat(counter)
+		// 载具端点的 msgID=0 必须 ≥T=50（03 §4.4）；37B 的 QGC 心跳形状会被入口丢弃。
+		return px4EncryptedHeartbeat(counter)
 	}
 	return encryptedPayload(counter)
 }
@@ -725,6 +806,13 @@ func encryptedPayload(counter uint64) []byte {
 // 内容对路由器无意义——mavp2p 不解密，判据只有 msgID 与长度（§2.3/§2.5）。
 func encryptedHeartbeat(counter uint64) []byte {
 	p := make([]byte, 37)
+	binary.BigEndian.PutUint64(p[:8], counter)
+	return p
+}
+
+// px4EncryptedHeartbeat 构造 PX4 加密心跳 payload：92B ≥ T=50。
+func px4EncryptedHeartbeat(counter uint64) []byte {
+	p := make([]byte, 92)
 	binary.BigEndian.PutUint64(p[:8], counter)
 	return p
 }
@@ -820,4 +908,55 @@ func TestProgramRejectsSharedGCSEndpoint(t *testing.T) {
 	require.Error(t, err, "同一端点同时作为 GCS 与载具入口 ⇒ 方向无从区分")
 	require.Contains(t, err.Error(), "不同端点",
 		"错误信息要说明两者必须分开，否则用户只会把它当成端口冲突")
+}
+
+// startTestOracle 起一个最小的 Unix socket 验签服务：读请求、原样回 reqID + 状态 0。
+// 端到端用例只关心路由/下游，不关心密码学；CLI 侧的 --verify-* 由 main_test 的配置用例覆盖。
+func startTestOracle(t *testing.T) (string, func()) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "verify.sock")
+	ln, err := net.Listen("unix", path)
+	require.NoError(t, err)
+
+	var (
+		once sync.Once
+		wg   sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer conn.Close() //nolint:errcheck
+				hdr := make([]byte, 12)
+				if _, err := io.ReadFull(conn, hdr); err != nil {
+					return
+				}
+				payload := make([]byte, int(binary.BigEndian.Uint16(hdr[10:12])))
+				if _, err := io.ReadFull(conn, payload); err != nil {
+					return
+				}
+				out := make([]byte, 5)
+				copy(out[:4], hdr[1:5])
+				out[4] = 0
+				_, _ = conn.Write(out)
+			}()
+		}
+	}()
+
+	stop := func() {
+		once.Do(func() {
+			ln.Close() //nolint:errcheck
+			wg.Wait()
+		})
+	}
+	t.Cleanup(stop)
+	return path, stop
 }

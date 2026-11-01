@@ -44,6 +44,7 @@ const (
 // 以及 FIFO 投递队列满。它们共用这一套写法，但**每条文案各持一个实例** ——
 // 单个实例只有一条 msg 当节流键，两条文案共用一个会互相顶掉（见 warnKeyed）。
 type throttledLog struct {
+	mu  sync.Mutex
 	at  time.Time
 	msg string
 }
@@ -57,12 +58,18 @@ func (l *throttledLog) warn(interval time.Duration, format string, args ...any) 
 // 需要它，是因为 warn 拿格式化后的全文当键：输出里只要含**每次都变**的值（累计丢帧数、
 // 错误详情、时刻），键就每帧都不同 ⇒ 节流形同虚设，日志反被刷屏（帧率可达 20Hz）。
 // warnKeyed 把键固定成一句稳定的文案，变化的量照样打进输出。
+// ‼️ 必须并发安全：Sink 会被主事件循环与每设备 drain goroutine 并发调用
+// （messageman 验签通过后直接喂 Sink），队列满时多个 goroutine 会同时到这里。
+// log.Printf 放在锁外：持锁做 I/O 会把其它投递方一起阻塞。
 func (l *throttledLog) warnKeyed(interval time.Duration, key, format string, args ...any) {
+	l.mu.Lock()
 	if key == l.msg && time.Since(l.at) < interval {
+		l.mu.Unlock()
 		return
 	}
 	l.msg = key
 	l.at = time.Now()
+	l.mu.Unlock()
 	log.Printf("WARN: fifofilter: %s", fmt.Sprintf(format, args...))
 }
 

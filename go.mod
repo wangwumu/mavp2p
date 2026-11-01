@@ -27,7 +27,13 @@ require (
 // 这一处；`marshalTo()` 两边都不校验，故只影响读方向。
 //
 // 与 data_writer 指向**同一份** fork（那边写的是 `../../gomavlib`，同一目录）。
-// ⚠️ 相对路径 replace ⇒ `scripts/*.mk` 与 `.github/workflows/*` 的 Docker 构建会失败
-// （build context 只含本目录，`../gomavlib` 不存在）。发布 / CI 前需改用 module-path
-// replace（fork 已有 tag `v4.0.1-deviceid4b`）或 `go mod vendor`。
+//
+// ‼️ 依赖已 **vendor 进本仓库**（`vendor/`，随仓库提交）。构建/测试默认走 `-mod=vendor`，
+// 不读取 `../gomavlib` —— Docker 构建（build context 只含本目录）与换机器构建都能过，
+// 已在 fork 目录被移走的条件下实测（`go build ./...` + `go test`）。
+//
+// 下面的 replace **只为** `go mod vendor` / `go mod tidy` 提供 fork 源，正常构建用不到：
+//   - fork 改了代码 ⇒ 必须在本目录重新跑 `go mod vendor` 并提交 `vendor/` 的差异；
+//     漏做不会报错，构建会静默沿用 vendor 里的**旧**代码。
+//   - 在没有 `../gomavlib` 的机器上，`go mod tidy` / `go mod vendor` 会失败（这是预期的）。
 replace github.com/bluenviron/gomavlib/v4 => ../gomavlib

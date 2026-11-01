@@ -3,6 +3,7 @@ package messageman
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/bluenviron/gomavlib/v4"
 	"github.com/bluenviron/gomavlib/v4/pkg/frame"
@@ -46,7 +47,12 @@ func TestDownlinkRebuildRequiresAircraftSegment(t *testing.T) {
 		{name: "invalid id with zero counter is rejected", did: 91002, counter: 0, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// 号段合法的帧在 P5 后还要过验签（无映射 ⇒ needVerify），
+			// 用 fake oracle 放行，才能观察到「重建 + 水位 + Sink」。
+			o := startFakeOracle(t, func(fakeOracleRequest) fakeOracleReply { return passReply() })
 			m := newBareManager()
+			m.VerifySocket = o.path()
+			m.VerifyTimeout = 500 * time.Millisecond
 			sink := &countSink{}
 			m.Sink = sink
 
@@ -66,6 +72,7 @@ func TestDownlinkRebuildRequiresAircraftSegment(t *testing.T) {
 			m.processEncrypted(ch, tc.did, fr, dirDownlink)
 
 			if tc.want {
+				waitVerifyIdle(t, m)
 				require.Contains(t, m.px4Map, tc.did, "合法飞机号段必须能重建缓存")
 				e, ok := m.lastNonce[nonceKey{deviceID: tc.did, dir: dirDownlink}]
 				require.True(t, ok, "重建后必须正常推进下行水位")

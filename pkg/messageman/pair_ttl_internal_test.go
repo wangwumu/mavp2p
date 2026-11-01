@@ -30,11 +30,17 @@ func newBareManager() *Manager {
 		qgcOnline:           map[*gomavlib.Channel]*qgcEntry{},
 		pairs:               map[pairKey]*pairEntry{},
 		lastNonce:           map[nonceKey]nonceEntry{},
+		standbyCandidates:   map[uint32][]candidate{},
+		lastTrustedDownlink: map[uint32]trustedMark{},
+		sessionGate:         map[uint32]gateState{},
+		lastStandbyPublish:  map[uint32]time.Time{},
+		lastCandidateAdmit:  map[uint32]time.Time{},
 		emptyDownlinkLogged: map[uint32]time.Time{},
 		regDiag:             map[*gomavlib.Channel]regDiagEntry{},
 		hbDiag:              map[uint32]time.Time{},
 		fanoutDiag:          map[uint32]time.Time{},
 		dropDiag:            map[*gomavlib.Channel]dropDiagEntry{},
+		verifyDiag:          map[verifyDiagKey]time.Time{},
 	}
 }
 
@@ -98,7 +104,8 @@ func TestPX4DownlinkKeepsPairButNotFanout(t *testing.T) {
 	staleSeen := time.Now().Add(-time.Hour)
 	staleQGC := time.Now().Add(-3 * m.MapTTL)
 
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: staleSeen}
+	// handshaked=true + 同通道 ⇒ D13 免验签，本帧同步走完（本用例只测配对字段）。
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: staleSeen, handshaked: true}
 	pk := pairKey{qgcCh: ch, px4DeviceID: did}
 	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: staleSeen, qgcSeen: staleQGC}
 

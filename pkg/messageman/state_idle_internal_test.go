@@ -176,7 +176,8 @@ func TestEncryptedDownlinkRefreshesPairTraffic(t *testing.T) {
 	m := newBareManager()
 	ch := &gomavlib.Channel{}
 	stale := time.Now().Add(-2 * time.Hour)
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: stale}
+	// handshaked=true + 同通道 ⇒ D13 免验签，本帧同步走完；本用例只测 lastTraffic 写点。
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: stale, handshaked: true}
 	pk := pairKey{qgcCh: ch, px4DeviceID: did}
 	m.pairs[pk] = &pairEntry{px4Ch: ch, lastSeen: stale, qgcSeen: time.Now(), lastTraffic: stale}
 
@@ -254,6 +255,10 @@ func TestPrunePurgesIdleDiagTables(t *testing.T) {
 	m.hbDiag[10000002] = time.Now()
 	m.fanoutDiag[10000003] = time.Now().Add(-2 * time.Hour)
 	m.fanoutDiag[10000004] = time.Now()
+	// 验签失败节流表：键是 deviceID+状态，同样只增不减（每个换过密钥/出过 service
+	// 故障的设备都会留一条），按同一空闲阈值回收。
+	m.verifyDiag[verifyDiagKey{deviceID: 10000005, status: verifyTagFail}] = time.Now().Add(-2 * time.Hour)
+	m.verifyDiag[verifyDiagKey{deviceID: 10000006, status: verifyNoKey}] = time.Now()
 
 	m.prune()
 
@@ -275,6 +280,10 @@ func TestPrunePurgesIdleDiagTables(t *testing.T) {
 	require.False(t, fanoutIdle, "fanoutDiag 的陈旧条目没有被回收")
 	_, fanoutFresh := m.fanoutDiag[10000004]
 	require.True(t, fanoutFresh, "fanoutDiag 的新鲜条目被误删")
+	_, vIdle := m.verifyDiag[verifyDiagKey{deviceID: 10000005, status: verifyTagFail}]
+	require.False(t, vIdle, "verifyDiag 的陈旧条目没有被回收（该表只增不减，每台失败过的设备留一条）")
+	_, vFresh := m.verifyDiag[verifyDiagKey{deviceID: 10000006, status: verifyNoKey}]
+	require.True(t, vFresh, "verifyDiag 的新鲜条目被误删 ⇒ 正在故障的设备的失败日志失去节流")
 }
 
 // TestInitializeRejectsNegativeDurations 钉住入口校验：负时长不得被当成「用默认值」。
@@ -298,57 +307,19 @@ func TestInitializeRejectsNegativeDurations(t *testing.T) {
 	wg.Wait()
 }
 
-// TestNonceSiblingDirectionRefreshed 钉住 touchSiblingNonce：任一方向有真实帧时，
-// 同 deviceID 的另一方向水位一并续期。
+// TestNonceDirectionsAreIndependent 钉住 D12：水位只由**本方向**的真实帧刷新。
 //
-// 背景（§2.5 拦截的副作用）：建链后 QGC 的 1 Hz 上行心跳被拦、不推进上行水位，而飞行中
-// 的加密下行一直推进下行水位 ⇒ 上行水位的 lastSeen 停在最后一条**真实**上行上，10 分钟后
-// 被 prune 回收、窗口随之重开。这条链路其实一直活跃。
-func TestNonceSiblingDirectionRefreshed(t *testing.T) {
+// 旧实现让任一方向活跃时给另一方向续期；定稿改为各管各的。§2.5 拦截会让建链后的上行
+// 心跳不再推进上行水位，因此上行水位可能在该方向确实很久没有真实帧时被回收 —— 这是
+// 定稿接受的代价（03 §4.3.6 / §5.10），不再用双向续期掩盖。
+func TestNonceDirectionsAreIndependent(t *testing.T) {
 	const did = uint32(10000001)
 
 	m := newBareManager()
 	ch := &gomavlib.Channel{}
 	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now()}
-
-	stale := time.Now().Add(-2 * time.Hour)
-	downKey := nonceKey{deviceID: did, dir: dirDownlink}
-	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: stale}
-
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
-
-	up, ok := m.lastNonce[nonceKey{deviceID: did, dir: dirUplink}]
-	require.True(t, ok, "上行水位没有推进")
-	require.Equal(t, uint64(3), up.counter, "上行水位 counter 写错")
-
-	down, ok := m.lastNonce[downKey]
-	require.True(t, ok, "下行水位被这帧上行删了")
-	require.True(t, down.lastSeen.After(stale),
-		"上行活跃时下行水位没有续期 ⇒ 对称失效：只发不收的链路其下行水位会被空闲回收")
-	require.Equal(t, uint64(2), down.counter, "续期不得改动 counter（那会破坏防重放判据）")
-}
-
-// TestNonceSiblingDirectionRefreshedByDownlink 钉住反向的那一半：**下行**活跃时上行水位
-// 一并续期。
-//
-// 这正是 §2.5 拦截造成的真实形态：建链后 QGC 的 1 Hz 上行心跳被拦、上行水位不再前进，
-// 而飞行中的加密下行一直在刷下行水位。若下行不续上行，上行水位会在 10 分钟后被 prune
-// 回收 —— 删掉 manager.go 下行分支里那次 touchSiblingNonce，本用例必须红。
-func TestNonceSiblingDirectionRefreshedByDownlink(t *testing.T) {
-	const did = uint32(10000001)
-
-	m := newBareManager()
-	// 同一 channel 指针同时当 PX4 来源与配对 QGC ⇒ 扇出末尾的 `qgc != srcCh` 跳过写，
-	// Node 可留 nil（与 TestEncryptedDownlinkRefreshesPairTraffic 同一手法）。
-	// 注意：本用例传 dirDownlink，下行分支根本不读 qgcOnline —— 该表只在 dirUplink
-	// 分支充当登记/授权闸，不参与方向判定（方向已在 ProcessFrame 入口由端点定死）。
-	ch := &gomavlib.Channel{}
-	now := time.Now()
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: now}
-	m.pairs[pairKey{qgcCh: ch, px4DeviceID: did}] = &pairEntry{
-		px4Ch: ch, lastSeen: now, qgcSeen: now, lastTraffic: now,
-	}
+	// D13 前提：已握手 + 同通道 ⇒ 下行走同步路径。
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now(), handshaked: true}
 
 	stale := time.Now().Add(-2 * time.Hour)
 	upKey := nonceKey{deviceID: did, dir: dirUplink}
@@ -356,46 +327,63 @@ func TestNonceSiblingDirectionRefreshedByDownlink(t *testing.T) {
 
 	m.processEncrypted(ch, did, downlinkFrame(did, 2), dirDownlink)
 
-	up, ok := m.lastNonce[upKey]
-	require.True(t, ok, "下行水位写入时把上行水位删了")
-	require.True(t, up.lastSeen.After(stale),
-		"下行活跃时上行水位没有续期 ⇒ §2.5 拦截期间上行水位 10 分钟后被空闲回收、窗口无端重开")
-	require.Equal(t, uint64(3), up.counter, "续期不得改动 counter（那会破坏防重放判据）")
+	require.Equal(t, nonceEntry{counter: 3, lastSeen: stale}, m.lastNonce[upKey],
+		"D12：下行不得刷新上行水位（旧实现会续期）")
+	down := m.lastNonce[nonceKey{deviceID: did, dir: dirDownlink}]
+	require.Equal(t, uint64(2), down.counter)
 }
 
-// TestActiveNonceWatermarkSurvivesPrune 把「续期」与「prune」接起来：一条上下行都活跃的
-// 链路，它的上行水位不得因为 §2.5 拦截而先变旧、再被回收。
-func TestActiveNonceWatermarkSurvivesPrune(t *testing.T) {
+// TestNonceUplinkDoesNotRefreshDownlink 反向对照：上行也不得续期下行水位。
+func TestNonceUplinkDoesNotRefreshDownlink(t *testing.T) {
+	const did = uint32(10000002)
+
+	m := newBareManager()
+	ch := &gomavlib.Channel{}
+	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now(), handshaked: true}
+
+	stale := time.Now().Add(-2 * time.Hour)
+	downKey := nonceKey{deviceID: did, dir: dirDownlink}
+	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: stale}
+
+	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
+
+	require.Equal(t, nonceEntry{counter: 2, lastSeen: stale}, m.lastNonce[downKey],
+		"D12：上行不得刷新下行水位")
+}
+
+// TestIdleUplinkWatermarkIsReclaimed 把 D12 与 prune 接起来：链路下行活跃、上行很久没有
+// 真实帧（§2.5 拦掉了心跳）⇒ 上行水位按空闲回收。这不是缺陷，是定稿接受的代价。
+func TestIdleUplinkWatermarkIsReclaimed(t *testing.T) {
 	const did = uint32(10000001)
 
 	m := newBareManager()
 	m.StateIdleTimeout = time.Minute
 	ch := &gomavlib.Channel{}
-	m.qgcOnline[ch] = &qgcEntry{lastSeen: time.Now()}
-	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now()}
-
-	downKey := nonceKey{deviceID: did, dir: dirDownlink}
-	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: time.Now().Add(-2 * time.Hour)}
-
-	// 一帧真实上行（非心跳 ⇒ 不被 §2.5 拦截）：推进上行水位并给下行续期。
-	m.processEncrypted(ch, did, idleTestUplinkFrame(did, 3), dirUplink)
-	m.prune()
+	m.px4Map[did] = &px4Entry{channel: ch, lastSeen: time.Now(), handshaked: true}
 
 	upKey := nonceKey{deviceID: did, dir: dirUplink}
+	m.lastNonce[upKey] = nonceEntry{counter: 3, lastSeen: time.Now().Add(-2 * time.Hour)}
+	downKey := nonceKey{deviceID: did, dir: dirDownlink}
+	m.lastNonce[downKey] = nonceEntry{counter: 2, lastSeen: time.Now()}
+
+	m.prune()
+
 	_, upKept := m.lastNonce[upKey]
-	require.True(t, upKept, "刚有真实上行的水位被 prune 回收了")
+	require.False(t, upKept, "上行水位空闲超阈值必须回收（D12 不再由下行续期）")
 	_, downKept := m.lastNonce[downKey]
-	require.True(t, downKept,
-		"下行水位被回收 ⇒ touchSiblingNonce 没生效或 prune 读的时间戳不对，窗口被无端重开")
+	require.True(t, downKept, "下行水位新鲜，不该被回收")
 }
 
 // TestStandbyHeartbeatDoesNotRefreshLastTraffic 钉住待命心跳**不算流量**：
-// 它只在「该 deviceID 有下行水位」时清配对，其余情况下连配对都不碰。
+// 没有可信下行证据时它只能登记候选，连配对与 px4Map 都不碰。
 // 若它也刷 lastTraffic，PX4 关机前发的那串待命心跳会把幽灵配对续到下一次开机。
 func TestStandbyHeartbeatDoesNotRefreshLastTraffic(t *testing.T) {
 	const did = uint32(10000001)
 
 	m := newBareManager()
+	sink := &countSink{}
+	m.Sink = sink
 	px4Ch := &gomavlib.Channel{}
 	staleSeen := time.Now().Add(-2 * time.Hour)
 	traffic := time.Now().Add(-20 * time.Minute)
@@ -407,13 +395,15 @@ func TestStandbyHeartbeatDoesNotRefreshLastTraffic(t *testing.T) {
 	m.processStandbyHeartbeat(px4Ch, did, standbyFrame(did))
 
 	pe, ok := m.pairs[pk]
-	require.True(t, ok, "没有下行水位的待命心跳不该清配对（那是「开机」不是「任务结束」）")
+	require.True(t, ok, "候选路径不得清配对")
 	require.Equal(t, traffic, pe.lastTraffic, "待命心跳刷新了 lastTraffic ⇒ 不活跃的配对靠心跳永不过期")
-	// 阳性对照：同一帧确实刷新了 px4Map（否则「没刷 lastTraffic」可以归因于「什么都没做」）。
+	// 阳性对照：同一帧确实被处理了（候选登记 + 发布），否则上面的断言可以靠「什么都没做」假绿。
+	require.Contains(t, m.standbyCandidates, did)
+	require.Equal(t, 1, sink.n)
 	m.mu.Lock()
 	px4 := m.px4Map[did]
 	m.mu.Unlock()
-	require.True(t, px4.lastSeen.After(staleSeen), "前提自检失败：待命心跳没有刷新 px4Map.lastSeen")
+	require.Equal(t, staleSeen, px4.lastSeen, "候选路径不得续 px4Map.lastSeen")
 }
 
 // TestIdlePurgedPairIsRebuiltOnlyByRegistration 钉住 10 分钟回收的**可用性代价**：
@@ -434,7 +424,8 @@ func TestIdlePurgedPairIsRebuiltOnlyByRegistration(t *testing.T) {
 	px4Ch := &gomavlib.Channel{}
 	now := time.Now()
 	m.qgcOnline[qgcCh] = &qgcEntry{lastSeen: now}
-	m.px4Map[did] = &px4Entry{channel: px4Ch, lastSeen: now}
+	// handshaked=true ⇒ 同通道下行走 D13 免验签；本用例只关心配对是否被重建。
+	m.px4Map[did] = &px4Entry{channel: px4Ch, lastSeen: now, handshaked: true}
 	pk := pairKey{qgcCh: qgcCh, px4DeviceID: did}
 	m.pairs[pk] = &pairEntry{px4Ch: px4Ch, lastSeen: now, qgcSeen: now, lastTraffic: now.Add(-2 * time.Hour)}
 
@@ -613,9 +604,9 @@ func TestChannelCloseKeepsNonceWatermark(t *testing.T) {
 		"通道关闭清掉了防重放水位 ⇒ 断线重连后的第一条旧帧可被重放（NAT 重建 counter 是连续的）")
 }
 
-// TestSiblingNonceIsNotCreated 钉住 touchSiblingNonce 只**续期**、不**新建**：
-// 从没出现过的方向没有可续的水位，伪造一条 counter=0 的条目会掩盖真实的首帧。
-func TestSiblingNonceIsNotCreated(t *testing.T) {
+// TestNonceDoesNotCreateOtherDirection 钉住 D12 的另一个方向：一个方向活跃时
+// 不得为另一方向**新建**水位。从没出现过的方向伪造一条 counter=0 的条目会掩盖真实首帧。
+func TestNonceDoesNotCreateOtherDirection(t *testing.T) {
 	const did = uint32(10000003)
 
 	m := newBareManager()
@@ -630,4 +621,32 @@ func TestSiblingNonceIsNotCreated(t *testing.T) {
 	_, downOK := m.lastNonce[nonceKey{deviceID: did, dir: dirDownlink}]
 	require.False(t, downOK,
 		"只出现过上行的设备被伪造了一条下行水位 ⇒ 「从没出现过的方向」与「活跃方向」被混为一谈")
+}
+
+// TestMapTTLPruneClearsPairChannels 钉住 03 §4.3.1：px4Map 被 MapTTL 剪掉时，
+// 该 deviceID 名下所有配对的 px4Ch 必须置空（配对保留），否则配对继续指向一个
+// 已不存在的权威通道，违反「px4Ch 只能为空或等于已验签映射」。
+func TestMapTTLPruneClearsPairChannels(t *testing.T) {
+	const did = uint32(10000001)
+
+	m := newBareManager()
+	dead := &gomavlib.Channel{}
+	q1, q2 := &gomavlib.Channel{}, &gomavlib.Channel{}
+	now := time.Now()
+
+	m.px4Map[did] = &px4Entry{channel: dead, lastSeen: now.Add(-2 * m.mapTTL()), handshaked: true}
+	for _, q := range []*gomavlib.Channel{q1, q2} {
+		m.pairs[pairKey{qgcCh: q, px4DeviceID: did}] = &pairEntry{
+			px4Ch: dead, lastSeen: now, qgcSeen: now, lastTraffic: now,
+		}
+	}
+
+	m.prune()
+
+	require.NotContains(t, m.px4Map, did, "前提自检：MapTTL 应剪掉映射")
+	for _, q := range []*gomavlib.Channel{q1, q2} {
+		p := m.pairs[pairKey{qgcCh: q, px4DeviceID: did}]
+		require.NotNil(t, p, "配对应保留，由下一次登记/验签晋升补齐 px4Ch")
+		require.Nil(t, p.px4Ch, "映射被剪后配对不得继续指向旧通道")
+	}
 }
